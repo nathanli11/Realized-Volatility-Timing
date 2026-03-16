@@ -64,7 +64,9 @@ import pandas as pd
 from scipy.optimize import minimize
 
 try:
-    from filterpy.kalman import UnscentedKalmanFilter as UKF
+    # On utilise uniquement MerweScaledSigmaPoints — l'API publique stable de filterpy.
+    # UnscentedKalmanFilter n'est pas importé pour éviter les attributs internes
+    # instables (_UT, _num_sigmas, sigmas_f) qui varient selon la version installée.
     from filterpy.kalman import MerweScaledSigmaPoints
 except ImportError as exc:
     raise ImportError("filterpy est requis : pip install filterpy") from exc
@@ -116,125 +118,148 @@ class HestonParams:
 
 
 
-# HestonUKFCore — sous-classe filterpy avec correction ρ dans update()
+# HestonUKFCore — implémentation autonome du UKF Heston
+#
+# On n'hérite PAS de filterpy.UnscentedKalmanFilter pour rester indépendant
+# de ses attributs internes (_UT, _num_sigmas, sigmas_f…) dont les noms
+# varient selon la version installée.
+# On utilise uniquement MerweScaledSigmaPoints (API publique stable) pour
+# calculer les sigma-points et leurs poids, puis on implémente le cycle
+# predict / update à la main — 20 lignes, zéro attribut privé.
 
-class HestonUKFCore(UKF):
-    """UKF de Heston avec cross-covariance P_{xz} = ρ·ξ·v_t·Δt correctement injectée.
+class HestonUKFCore:
+    """UKF de Heston entièrement autonome avec correction ρ·ξ·v_t·Δt.
 
-    Problème de filterpy
+    Seule dépendance filterpy : MerweScaledSigmaPoints (API publique stable).
+    Toute la logique predict / update est réimplémentée ici sans recourir à
+    aucun attribut interne de UnscentedKalmanFilter (_UT, sigmas_f, etc.).
+
+    Attributs principaux
     --------------------
-    filterpy calcule P_{xz} uniquement depuis les sigma-points propagés :
-        P_{xz} = Σ_i Wc_i · (σᵢ_f − x̂)(h(σᵢ_f) − ẑ)ᵀ
-    Ce calcul ignore la corrélation entre les bruits d'état et d'observation.
-    Pour Heston le terme manquant est :
-        Cov(dv_t, r_t) = Cov(ξ√v_t dW_2, √v_t dW_1) = ρ · ξ · v_t · Δt
-
-    Solution
-    --------
-    On surcharge update() en y ajoutant ce terme analytique à P_{xz}
-    AVANT le calcul du gain de Kalman K = P_{xz} · S⁻¹.
-
-    Attribut externe
-    ----------------
-    _rho_xi_vt_dt : float
-        Valeur courante de ρ·ξ·v_t·Δt, mise à jour avant chaque appel à update().
+    x  : np.ndarray (1,)   État courant v̂_t
+    P  : np.ndarray (1,1)  Covariance de l'état
+    Q  : np.ndarray (1,1)  Bruit de processus  (mis à jour à chaque step)
+    R  : np.ndarray (1,1)  Bruit de mesure     (mis à jour à chaque step)
+    S  : np.ndarray (1,1)  Covariance d'innovation (après update)
+    K  : np.ndarray (1,1)  Gain de Kalman      (après update)
+    _rho_xi_vt_dt : float  Correction ρ·ξ·v_t·Δt (mis à jour à chaque step)
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Terme de correction initialisé à 0 — sera mis à jour avant chaque step
+    def __init__(self, fx, hx, x0: float, P0: float, Q0: float, R0: float,
+                 dt: float, alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0):
+        # Fonctions d'état et d'observation
+        self.fx = fx
+        self.hx = hx
+        self.dt = dt
+
+        # État initial et covariance
+        self.x = np.array([x0])
+        self.P = np.array([[P0]])
+
+        # Matrices de bruit (state-dependent — mises à jour dans _step())
+        self.Q = np.array([[Q0]])
+        self.R = np.array([[R0]])
+
+        # Correction ρ — mise à jour dans _step() avant chaque update()
         self._rho_xi_vt_dt: float = 0.0
 
-    def update(self, z, R=None, UT=None, hx=None, **hx_args):
-        """update() avec la cross-covariance P_{xz}.
+        # Diagnostics
+        self.S  = np.array([[R0]])
+        self.K  = np.zeros((1, 1))
 
-        z  : array-like   Observation (log-return r_t).
-        R  : array, opt   Bruit de mesure (défaut : self.R).
-        UT : callable, opt Transformée non-parfumée (défaut : self._UT).
-        hx : callable, opt Fonction d'observation (défaut : self.hx).
+        # Générateur de sigma-points Merwe — seule API filterpy utilisée
+        # alpha=1e-3 : points proches de la moyenne (évite v_t < 0)
+        # beta=2     : optimal pour gaussienne
+        # kappa=0    : standard pour n=1
+        self._sp = MerweScaledSigmaPoints(n=1, alpha=alpha, beta=beta, kappa=kappa)
+
+    def predict(self) -> None:
+        """Étape de prédiction : propage les sigma-points à travers fx.
+
+        v̂_{t|t-1} = Σ Wm_i · f(σ_i)
+        P_{t|t-1}  = Σ Wc_i · (f(σ_i) − v̂)² + Q_t
         """
-        if z is None:
-            return
+        # Génération des 2n+1 = 3 sigma-points autour de l'état courant
+        sigmas = self._sp.sigma_points(self.x, self.P)
+        Wm, Wc = self._sp.Wm, self._sp.Wc
 
-        # Valeurs par défaut
-        if hx is None:
-            hx = self.hx
-        if UT is None:
-            UT = self._UT
-        if R is None:
-            R = self.R
-        if np.isscalar(R):
-            R = np.eye(self.dim_z) * R
+        # Propagation déterministe à travers f (drift de Heston)
+        sigmas_f = np.array([self.fx(s, self.dt) for s in sigmas])
 
-        # ------------------------------------------------------------------
-        # Étape 1 — Propager les sigma-points à travers hx
-        # Chaque sigma-point prédit en état est transformé par la fonction
-        # d'observation pour obtenir la prédiction de l'observation associée.
-        # ------------------------------------------------------------------
-        sigmas_h = np.zeros((self._num_sigmas, self.dim_z))
-        for i, s in enumerate(self.sigmas_f):
-            sigmas_h[i] = hx(s, **hx_args)
+        # Moyenne prédite : v̂_{t|t-1}
+        self.x = np.sum(Wm[:, None] * sigmas_f, axis=0)
 
-        # ------------------------------------------------------------------
-        # Étape 2 — Moyenne prédite ẑ et covariance d'innovation S
-        # UT = Unscented Transform : reconstruction de la distribution
-        # de l'observation depuis les sigma-points propagés et leurs poids.
-        # S = Var(r_t | F_{t-1}) = somme pondérée des déviations + R_t
-        # ------------------------------------------------------------------
-        zp, S = UT(sigmas_h, self.Wm, self.Wc, R)
+        # Covariance prédite : P_{t|t-1} + Q_t
+        P_pred = np.zeros((1, 1))
+        for i in range(len(Wm)):
+            d = (sigmas_f[i] - self.x).reshape(-1, 1)
+            P_pred += Wc[i] * (d @ d.T)
+        self.P = P_pred + self.Q
 
-        # ------------------------------------------------------------------
-        # Étape 3 — Cross-covariance P_{xz} depuis les sigma-points
-        # Cov(v_{t+1}, r_t) approximée par la UT (partie déterministe seule).
-        # dim_x = dim_z = 1  →  P_{xz} est un scalaire (1×1).
-        # ------------------------------------------------------------------
-        Pxz = np.zeros((self.dim_x, self.dim_z))
-        for i in range(self._num_sigmas):
-            dx = (self.sigmas_f[i] - self.x).reshape(-1, 1)
-            dz = (sigmas_h[i] - zp).reshape(-1, 1)
-            Pxz += self.Wc[i] * dx @ dz.T
-
-        # ------------------------------------------------------------------
-        # Étape 4 — CORRECTION ρ  (spécifique Heston, absente de filterpy)
-        # On ajoute le terme analytique issu de la corrélation des Browniens :
-        #   Cov(ξ√v_t √Δt · ε^(2),  √(v_t Δt) · ε^(1))
-        #   = ξ√v_t √Δt · √(v_t Δt) · ρ
-        #   = ρ · ξ · v_t · Δt
-        # _rho_xi_vt_dt est calculé dans _step() juste avant chaque update().
-        # ------------------------------------------------------------------
-        Pxz[0, 0] += self._rho_xi_vt_dt
-
-        # ------------------------------------------------------------------
-        # Étape 5 — Gain de Kalman  K = P_{xz} · S⁻¹
-        # Le gain traduit : "de combien révise-t-on v̂_t pour une surprise r_t − ẑ ?".
-        # La correction ρ augmente |K| quand ρ < 0 (equity) : une chute du marché
-        # doit davantage faire réviser v_t à la hausse.
-        # ------------------------------------------------------------------
-        self.K = Pxz @ inv(S)
-
-        # ------------------------------------------------------------------
-        # Étape 6 — Mise à jour de l'état et de la covariance
-        # Formule de Kalman standard :
-        #   x_t|t  = x_t|t-1 + K · (r_t − ẑ_t)
-        #   P_t|t  = P_t|t-1 − K · S · Kᵀ
-        # ------------------------------------------------------------------
-        z = np.atleast_1d(z)
-        self.x = self.x + self.K @ (z - zp)
-        self.P = self.P - self.K @ S @ self.K.T
-
-        # Sauvegarde pour diagnostics (log-vraisemblance, déboggage)
-        self.zp = zp
-        self.S  = S
-        self.SI = inv(S)
-
-        # Contrainte physique : la variance doit rester strictement positive
+        # Clamp : variance prédite strictement positive
         self.x[0] = max(float(self.x[0]), 1e-8)
-        # Contrainte numérique : P doit rester définie positive
-        self.P = np.maximum(self.P, 1e-10 * np.eye(self.dim_x))
+        self.P    = np.maximum(self.P, 1e-10 * np.eye(1))
+
+        # Sauvegarder les sigma-points propagés pour update()
+        self._sigmas_f = sigmas_f
+        self._Wm = Wm
+        self._Wc = Wc
+
+    def update(self, z: float) -> None:
+        """Étape de mise à jour avec correction ρ·ξ·v_t·Δt dans P_{xz}.
+
+        Étapes :
+          1. Propager les sigma-points prédits à travers hx
+          2. Calculer ẑ et S (covariance d'innovation)
+          3. Calculer P_{xz} depuis les sigma-points
+          4. AJOUTER la correction ρ·ξ·v_t·Δt à P_{xz}
+          5. Gain de Kalman K = P_{xz} · S⁻¹
+          6. Mise à jour de x et P
+        """
+        sigmas_f = self._sigmas_f
+        Wm, Wc   = self._Wm, self._Wc
+
+        # --- Étape 1 : sigma-points dans l'espace d'observation ---
+        # h(σ_i) = E[r_t | σ_i] = (μ − σ_i/2) Δt
+        sigmas_h = np.array([self.hx(s) for s in sigmas_f])
+
+        # --- Étape 2 : moyenne prédite ẑ et covariance d'innovation S ---
+        # ẑ = Σ Wm_i · h(σ_i)
+        # S = Σ Wc_i · (h(σ_i) − ẑ)² + R_t
+        zp = float(np.sum(Wm * sigmas_h.flatten()))
+        S_val = float(np.sum(Wc * (sigmas_h.flatten() - zp) ** 2)) + float(self.R[0, 0])
+        S_val = max(S_val, 1e-12)
+
+        # --- Étape 3 : cross-covariance P_{xz} depuis les sigma-points ---
+        # Cov(v_{t+1}, r_t) approchée par la transformée non-parfumée seule
+        Pxz = 0.0
+        for i in range(len(Wm)):
+            dx = float(sigmas_f[i][0]) - float(self.x[0])
+            dz = float(sigmas_h[i][0]) - zp
+            Pxz += Wc[i] * dx * dz
+
+        # --- Étape 4 : CORRECTION ρ (terme manquant dans filterpy standard) ---
+        # Cov(ξ√v_t dW_2, √v_t dW_1) = ρ · ξ · v_t · Δt
+        # Injecté ici avant le calcul du gain
+        Pxz += self._rho_xi_vt_dt
+
+        # --- Étape 5 : gain de Kalman K = P_{xz} / S ---
+        K = Pxz / S_val
+
+        # --- Étape 6 : mise à jour état et covariance ---
+        innovation = float(z) - zp
+        self.x[0] = max(float(self.x[0]) + K * innovation, 1e-8)
+        self.P[0, 0] = max(self.P[0, 0] - K * S_val * K, 1e-10)
+
+        # Sauvegarde pour diagnostics (log-vraisemblance)
+        self.S   = np.array([[S_val]])
+        self.K   = np.array([[K]])
+        self.zp  = zp
+        self._innovation = innovation
 
 
 # =============================================================================
-# Factory — construit un HestonUKFCore initialisé
+# Factory interne — construit un HestonUKFCore initialisé
 # =============================================================================
 
 def _build_ukf_core(params: HestonParams, dt: float, v0: float) -> HestonUKFCore:
@@ -261,13 +286,6 @@ def _build_ukf_core(params: HestonParams, dt: float, v0: float) -> HestonUKFCore
     # alpha=1e-3 : points très proches de la moyenne (évite v_t < 0 lors de la propagation)
     # beta=2     : optimal pour gaussienne (annule l'erreur de Taylor d'ordre 4)
     # kappa=0    : scaling secondaire standard pour n=1
-    sigma_points = MerweScaledSigmaPoints(n=1, alpha=1e-3, beta=2.0, kappa=0.0)
-
-    # Construction du filtre : état scalaire (v_t), observation scalaire (r_t)
-    ukf = HestonUKFCore(
-        dim_x=1, dim_z=1, dt=dt, fx=None, hx=None, points=sigma_points
-    )
-
     # ------------------------------------------------------------------
     # Fonction d'état f(v_t) — partie déterministe de l'EDS de la variance
     # dv_t = κ(θ − v_t)dt  +  ξ√v_t dW_2,t
@@ -292,18 +310,16 @@ def _build_ukf_core(params: HestonParams, dt: float, v0: float) -> HestonUKFCore
         # Correction d'Itô : l'espérance du log-return dépend de v_t
         return np.array([(params.mu - 0.5 * v_val) * dt])
 
-    ukf.fx = fx
-    ukf.hx = hx
-
-    # État initial : v̂_0 = v0, incertitude initiale P_0 = v0
-    ukf.x = np.array([v0])
-    ukf.P = np.array([[v0]])
-
-    # Bruit de processus Q_t = ξ² v_t Δt  (variance du terme ξ√v_t dW_2)
-    ukf.Q = np.array([[params.xi ** 2 * v0 * dt]])
-
-    # Bruit de mesure R_t = v_t Δt  (variance du terme √v_t dW_1)
-    ukf.R = np.array([[v0 * dt]])
+    # Construction du filtre avec le nouveau constructeur autonome
+    ukf = HestonUKFCore(
+        fx  = fx,
+        hx  = hx,
+        x0  = v0,
+        P0  = v0,
+        Q0  = params.xi ** 2 * v0 * dt,   # Bruit de processus Q_t = ξ² v_t Δt
+        R0  = v0 * dt,                      # Bruit de mesure R_t = v_t Δt
+        dt  = dt,
+    )
 
     # Initialisation de la correction ρ (sera recalculée à chaque step)
     ukf._rho_xi_vt_dt = params.rho * params.xi * v0 * dt
@@ -752,6 +768,7 @@ def build_timing_positions(
     scaling: str = "linear",
     lookback: int = 63,
     max_leverage: float = 2.0,
+    threshold: float = 0.02,
     dt: float = 1.0 / 252.0,
     initial_params: Optional[HestonParams] = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
@@ -819,6 +836,7 @@ def build_timing_positions(
         scaling=scaling,
         lookback=lookback,
         max_leverage=max_leverage,
+        threshold=threshold, 
     )
     signal   = timer.compute_signal(spread)
     df_timed = timer.apply_timing(df_positions, signal)
