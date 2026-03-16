@@ -108,8 +108,10 @@ class StrategyBacktester:
             # FIX: use intrinsic payoff at expiration instead of potentially stale mid
             expiry_mask = df_day["expiration"] == df_day["date"]
             if expiry_mask.any():
-                call_mask = df_day["call_put"] == "C"
-                put_mask = df_day["call_put"] == "P"
+                call_put_filled = df_day["call_put"].fillna("")
+                call_mask = (call_put_filled == "C").to_numpy()
+                put_mask  = (call_put_filled == "P").to_numpy()
+
                 payoff = np.where(
                     call_mask,
                     np.maximum(df_day["spot"] - df_day["strike"], 0.0),
