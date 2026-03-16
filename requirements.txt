@@ -24,6 +24,7 @@ distributed
 executing
 fonttools
 fsspec
+filterpy
 gs-quant
 h11
 httpcore
