@@ -187,10 +187,6 @@ class StrategyBacktester:
         logging.info("No transaction cost applied.")
         return df_positions
 
-    # ------------------------------------------------------------------ #
-    #  Properties                                                          #
-    # ------------------------------------------------------------------ #
-
     @property
     def pnl(self) -> pd.DataFrame:
         check_is_true(self._is_backtested, "Call 'compute_backtest' first.")
@@ -220,9 +216,6 @@ class StrategyBacktester:
         self._df_drifted_positions = pd.DataFrame()
 
 
-# --------------------------------------------------------------------------- #
-#  Transaction cost subclasses                                                 #
-# --------------------------------------------------------------------------- #
 
 class BacktesterBidAskFromData(StrategyBacktester):
     """Use the bid/ask spread recorded in market data on trade dates.
@@ -253,16 +246,6 @@ class BacktesterBidAskFromData(StrategyBacktester):
 
 class BacktesterFixedRelativeBidAsk(StrategyBacktester):
     """Apply a fixed relative half-spread on trade dates.
-
-    Parameters passed via ``tcost_args``:
-        relative_half_spread (float): Half-spread as a fraction of mid.
-            Default 0.03 (i.e. 3 %).
-
-    Example
-    -------
-    >>> BacktesterFixedRelativeBidAsk(df_positions).compute_backtest(
-    ...     tcost_args={"relative_half_spread": 0.03}
-    ... )
     """
 
     def __init__(self, df_positions: pd.DataFrame) -> None:
