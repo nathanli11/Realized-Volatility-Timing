@@ -168,6 +168,8 @@ class HestonUKFCore:
         # Diagnostics
         self.S  = np.array([[R0]])
         self.K  = np.zeros((1, 1))
+        self._innovation: float = 0.0
+        self.zp: float = 0.0
 
         # Générateur de sigma-points Merwe — seule API filterpy utilisée
         # alpha=1e-3 : points proches de la moyenne (évite v_t < 0)
@@ -377,65 +379,8 @@ class HestonUKF:
         self._rolling_params: Optional[pd.DataFrame] = None
         # Série temporelle de la variance filtrée v̂_t (None avant filter())
         self._v_filtered: Optional[pd.Series] = None
-
-    @staticmethod
-    def _params_to_record(params: HestonParams) -> dict[str, float]:
-        """Sérialise HestonParams pour stockage dans un DataFrame."""
-        return {
-            "kappa": params.kappa,
-            "theta": params.theta,
-            "xi": params.xi,
-            "rho": params.rho,
-            "mu": params.mu,
-        }
-
-    @staticmethod
-    def _record_to_params(record: pd.Series) -> HestonParams:
-        """Reconstruit HestonParams depuis une ligne de calibration rolling."""
-        return HestonParams(
-            kappa=float(record["kappa"]),
-            theta=float(record["theta"]),
-            xi=float(record["xi"]),
-            rho=float(record["rho"]),
-            mu=float(record["mu"]),
-        )
-
-    def _update_core_functions(self, ukf: HestonUKFCore, params: HestonParams) -> None:
-        """Met à jour les fonctions du filtre pour refléter les paramètres du jour."""
-
-        def fx(v: np.ndarray, dt: float) -> np.ndarray:
-            v_val = max(float(v[0]), 1e-8)
-            v_next = v_val + params.kappa * (params.theta - v_val) * dt
-            return np.array([max(v_next, 1e-8)])
-
-        def hx(v: np.ndarray) -> np.ndarray:
-            v_val = max(float(v[0]), 1e-8)
-            return np.array([(params.mu - 0.5 * v_val) * self.dt])
-
-        ukf.fx = fx
-        ukf.hx = hx
-
-    def _cache_key(self, returns: pd.Series, window: int) -> str:
-        """Construit une clé de cache déterministe pour une calibration rolling."""
-        hasher = hashlib.sha256()
-        hasher.update(str(window).encode("utf-8"))
-        hasher.update(str(self.dt).encode("utf-8"))
-        hasher.update(str(self.optimizer_maxiter).encode("utf-8"))
-        hasher.update(np.asarray(self.initial_params.to_array(), dtype=np.float64).tobytes())
-        hasher.update(np.asarray(returns.index.view("i8"), dtype=np.int64).tobytes())
-        hasher.update(np.asarray(returns.values, dtype=np.float64).tobytes())
-        return hasher.hexdigest()
-
-    def _cache_path(self, returns: pd.Series, window: int) -> Optional[Path]:
-        """Retourne le chemin du cache rolling pour la série fournie."""
-        if self.cache_dir is None:
-            return None
-        return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.pkl"
-
-    @staticmethod
-    def _cache_columns() -> list[str]:
-        """Colonnes attendues pour le cache des paramètres rolling."""
-        return ["kappa", "theta", "xi", "rho", "mu"]
+        # DataFrame complet des diagnostics du filtre (v̂_t, innovation, gain, loglik) après filter_with_diagnostics()
+        self._filter_diagnostics: Optional[pd.DataFrame] = None
 
     # ------------------------------------------------------------------
     # Méthode interne : un pas predict-update avec mise à jour des matrices
@@ -443,8 +388,8 @@ class HestonUKF:
 
     def _step(
         self, ukf: HestonUKFCore, params: HestonParams, r: float
-    ) -> tuple[float, float]:
-        """Exécute un cycle predict → update et retourne (v̂_t, contribution LL).
+    ) -> dict[str, float]:
+        """Exécute un cycle predict → update et retourne les diagnostics du pas (v̂_t, contribution LL).
 
         Les matrices Q, R et la correction ρ doivent être mises à jour à chaque
         pas car elles dépendent de v_t (bruit multiplicatif dans Heston).
@@ -483,22 +428,34 @@ class HestonUKF:
         # On utilise l'état prédit après predict() pour être cohérent
         v_after_predict = max(float(ukf.x[0]), 1e-8)
         expected_r = (params.mu - 0.5 * v_after_predict) * self.dt
-        innovation = r - expected_r
 
         # Étape de mise à jour : intègre l'observation r_t
         # Appelle HestonUKFCore.update() qui injecte la correction ρ dans P_{xz}
         ukf.update(np.array([r]))
 
-        # Covariance d'innovation S_t stockée par HestonUKFCore.update()
-        S = float(ukf.S[0, 0]) if ukf.S is not None else v_pred * self.dt
-        S = max(S, 1e-12)
+        # Diagnostics venant du filtre
+        innovation = float(ukf._innovation)
+        innovation_var = float(ukf.S[0, 0]) if ukf.S is not None else v_pred * self.dt
+        innovation_var = max(innovation_var, 1e-12)
+        std_innovation = innovation / np.sqrt(innovation_var)
+        kalman_gain = float(ukf.K[0, 0]) if ukf.K is not None else np.nan
 
         # Contribution à la log-vraisemblance (décomposition en innovations) :
         # log p(r_t | F_{t-1}) = −½ [log(2π S_t) + ν_t² / S_t]
-        innov_ll = -0.5 * (np.log(2.0 * np.pi * S) + innovation ** 2 / S)
+        innov_ll = -0.5 * (np.log(2.0 * np.pi * innovation_var) + innovation ** 2 / innovation_var)
 
         v_updated = max(float(ukf.x[0]), 1e-8)
-        return v_updated, innov_ll
+        sigma_updated = np.sqrt(v_updated)
+        return {
+            "v_hat": v_updated,
+            "sigma_hat": sigma_updated,
+            "expected_return": expected_r,
+            "innovation": innovation,
+            "innovation_var": innovation_var,
+            "std_innovation": std_innovation,
+            "kalman_gain": kalman_gain,
+            "loglik": float(innov_ll),
+        }
 
     # ------------------------------------------------------------------
     # Log-vraisemblance (décomposition en innovations, UKF)
@@ -700,16 +657,17 @@ class HestonUKF:
 
         return self
 
-    # ------------------------------------------------------------------
-    # filter() — estimation de l'état v̂_t
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # filter_with_diagnostics() — estimation de l'état v̂_t + diagnostic
+    # ---------------------------------------------------------------------
 
-    def filter(self, log_returns: pd.Series) -> pd.Series:
-        """Estime la variance instantanée v̂_t par UKF sur toute la série.
+    def filter_with_diagnostics(self, log_returns: pd.Series) -> pd.DataFrame:
+        """ Estime la variance instantanée v̂_t par UKF sur toute la série.
+        Filtre la série et retourne un DataFrame complet de diagnostics.
 
-        Si fit() a produit une calibration rolling, chaque date t est filtrée
-        avec les paramètres calibrés sur la fenêtre [t-window, t), sans utiliser
-        le return du jour dans l'estimation des paramètres.
+        À chaque pas, la correction ρ·ξ·v_t·Δt est injectée dans P_{xz}
+        via HestonUKFCore.update(), donnant le gain de Kalman exact sous
+        la dynamique de Heston avec Browniens corrélés.
 
         Paramètres
         ----------
@@ -717,10 +675,11 @@ class HestonUKF:
 
         Retourne
         --------
-        pd.Series  Variance filtrée v̂_t sur les dates où les paramètres sont disponibles.
+        pd.DataFrame  Variance filtrée v̂_t + diagnostics
         """
+
         if self._params is None:
-            raise RuntimeError("Appeler fit() avant filter().")
+            raise RuntimeError("Appeler fit() avant filter_with_diagnostics().")
 
         returns = log_returns.dropna()
 
@@ -729,31 +688,104 @@ class HestonUKF:
             v0 = max(params.theta, 1e-6)
             ukf = _build_ukf_core(params, self.dt, v0)
 
-            v_estimates: list[float] = []
-            for r in returns.values:
-                v_upd, _ = self._step(ukf, params, float(r))
-                v_estimates.append(v_upd)
+        rows = []
+        for date, r in returns.items():
+            # _step() : predict → update avec correction ρ et matrices Q, R state-dependent
+            out = self._step(ukf, params, float(r))
+            out["date"] = date
+            rows.append(out)
 
-            self._v_filtered = pd.Series(v_estimates, index=returns.index, name="v_hat")
-            return self._v_filtered
+        df_diag = pd.DataFrame(rows).set_index("date")
+        df_diag.index.name = returns.index.name or "date"
 
-        rolling_index = self._rolling_params.index.intersection(returns.index)
-        if len(rolling_index) == 0:
-            raise RuntimeError("Aucune date commune entre les paramètres rolling et les returns.")
+        # Stocker le df filtré pour les propriétés dérivées (sigma_hat, spread)
+        self._v_filtered = df_diag["v_hat"].rename("v_hat")
+        self._filter_diagnostics = df_diag
+        return df_diag
 
-        first_params = self._record_to_params(self._rolling_params.loc[rolling_index[0]])
-        v0 = max(first_params.theta, 1e-6)
-        ukf = _build_ukf_core(first_params, self.dt, v0)
+    # ------------------------------------------------------------------
+    # filter() — estimation de l'état v̂_t
+    # ------------------------------------------------------------------
 
-        v_estimates: list[float] = []
-        for date in rolling_index:
-            params = self._record_to_params(self._rolling_params.loc[date])
-            self._update_core_functions(ukf, params)
-            v_upd, _ = self._step(ukf, params, float(returns.loc[date]))
-            v_estimates.append(v_upd)
+    def filter(self, log_returns: pd.Series) -> pd.Series:
+        """Estime la variance instantanée v̂_t par UKF sur toute la série.
 
-        self._v_filtered = pd.Series(v_estimates, index=rolling_index, name="v_hat")
-        return self._v_filtered
+        À chaque pas, la correction ρ·ξ·v_t·Δt est injectée dans P_{xz}
+        via HestonUKFCore.update(), donnant le gain de Kalman exact sous
+        la dynamique de Heston avec Browniens corrélés.
+
+        Paramètres
+        ----------
+        log_returns : pd.Series  Log-returns journaliers (index = dates).
+
+        Retourne
+        --------
+        pd.Series  Variance filtrée v̂_t (même index que log_returns).
+        """
+        df_diag = self.filter_with_diagnostics(log_returns)
+        return df_diag["v_hat"].rename("v_hat")
+
+    # ------------------------------------------------------------------
+    # forecast_variance() — forecast ponctuelle de variance
+    # ------------------------------------------------------------------
+
+    def forecast_variance(
+        self,
+        v_t: float,
+        horizon: int = 21,
+        params: Optional[HestonParams] = None,
+    ) -> float:
+        """Prévision de variance conditionnelle E[v_{t+h} | v_t].
+        
+        Utilise la formule analytique de Heston pour la prévision de variance
+        à horizon h (en jours): E[v_{t+h} | v_t] = θ+(v_t​−θ)e^−κu
+        """
+        p = params or self._params
+        if p is None:
+            raise RuntimeError("Paramètres non calibrés.")
+
+        v_t = max(float(v_t), 1e-8)
+        tau = horizon * self.dt
+        v_forecast = p.theta + (v_t - p.theta) * np.exp(-p.kappa * tau)
+        return max(float(v_forecast), 1e-8)
+    
+    # ------------------------------------------------------------------
+    # forecast_average_variance() — forecast moyenne de variance
+    # ------------------------------------------------------------------
+    
+    def forecast_average_variance(
+        self,
+        v_t: float,
+        horizon: int = 21,
+        params: Optional[HestonParams] = None,
+    ) -> float:
+        """Prévision de variance moyenne sur l'horizon [t, t+h]."""
+        p = params or self._params
+        if p is None:
+            raise RuntimeError("Paramètres non calibrés.")
+
+        v_t = max(float(v_t), 1e-8)
+        tau = horizon * self.dt
+
+        if p.kappa < 1e-10:
+            v_avg = v_t
+        else:
+            decay_term = (1.0 - np.exp(-p.kappa * tau)) / (p.kappa * tau)
+            v_avg = p.theta + (v_t - p.theta) * decay_term
+        return max(float(v_avg), 1e-8)
+    
+    # ----------------------------------------------------------------------------
+    # forecast_average_volatility() — helper pour forecast moyenne de volatilité
+    # ----------------------------------------------------------------------------
+    
+    def forecast_average_volatility(
+        self,
+        v_t: float,
+        horizon: int = 21,
+        params: Optional[HestonParams] = None,
+    ) -> float:
+        """Prévision de volatilité annualisée moyenne sur horizon."""
+        return np.sqrt(self.forecast_average_variance(v_t, horizon=horizon, params=params))
 
     # ------------------------------------------------------------------
     # Propriétés dérivées
@@ -796,9 +828,11 @@ class HestonUKF:
         return self._params
 
     @property
-    def rolling_params(self) -> Optional[pd.DataFrame]:
-        """Historique des paramètres calibrés date par date."""
-        return self._rolling_params
+    def filter_diagnostics(self) -> pd.DataFrame:
+        """DataFrame complet des diagnostics du filtre après filter_with_diagnostics()."""
+        if self._filter_diagnostics is None:
+            raise RuntimeError("Appeler filter_with_diagnostics() d'abord.")
+        return self._filter_diagnostics.copy()    
 
 
 # =============================================================================
