@@ -52,9 +52,11 @@ Dépendances
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -358,15 +360,82 @@ class HestonUKF:
         self,
         initial_params: Optional[HestonParams] = None,
         dt: float = 1.0 / 252.0,
+        cache_dir: Optional[str | Path] = ".cache/heston_ukf",
+        optimizer_maxiter: int = 300,
     ) -> None:
         # Point de départ de l'optimiseur (valeurs typiques equity si non fourni)
         self.initial_params = initial_params or HestonParams()
         # Pas de temps : 1/252 pour des données journalières
         self.dt = dt
+        # Répertoire de cache pour les calibrations rolling
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        # Nombre maximal d'itérations pour L-BFGS-B
+        self.optimizer_maxiter = optimizer_maxiter
         # Paramètres calibrés (None tant que fit() n'a pas été appelé)
         self._params: Optional[HestonParams] = None
+        # Historique des paramètres calibrés date par date
+        self._rolling_params: Optional[pd.DataFrame] = None
         # Série temporelle de la variance filtrée v̂_t (None avant filter())
         self._v_filtered: Optional[pd.Series] = None
+
+    @staticmethod
+    def _params_to_record(params: HestonParams) -> dict[str, float]:
+        """Sérialise HestonParams pour stockage dans un DataFrame."""
+        return {
+            "kappa": params.kappa,
+            "theta": params.theta,
+            "xi": params.xi,
+            "rho": params.rho,
+            "mu": params.mu,
+        }
+
+    @staticmethod
+    def _record_to_params(record: pd.Series) -> HestonParams:
+        """Reconstruit HestonParams depuis une ligne de calibration rolling."""
+        return HestonParams(
+            kappa=float(record["kappa"]),
+            theta=float(record["theta"]),
+            xi=float(record["xi"]),
+            rho=float(record["rho"]),
+            mu=float(record["mu"]),
+        )
+
+    def _update_core_functions(self, ukf: HestonUKFCore, params: HestonParams) -> None:
+        """Met à jour les fonctions du filtre pour refléter les paramètres du jour."""
+
+        def fx(v: np.ndarray, dt: float) -> np.ndarray:
+            v_val = max(float(v[0]), 1e-8)
+            v_next = v_val + params.kappa * (params.theta - v_val) * dt
+            return np.array([max(v_next, 1e-8)])
+
+        def hx(v: np.ndarray) -> np.ndarray:
+            v_val = max(float(v[0]), 1e-8)
+            return np.array([(params.mu - 0.5 * v_val) * self.dt])
+
+        ukf.fx = fx
+        ukf.hx = hx
+
+    def _cache_key(self, returns: pd.Series, window: int) -> str:
+        """Construit une clé de cache déterministe pour une calibration rolling."""
+        hasher = hashlib.sha256()
+        hasher.update(str(window).encode("utf-8"))
+        hasher.update(str(self.dt).encode("utf-8"))
+        hasher.update(str(self.optimizer_maxiter).encode("utf-8"))
+        hasher.update(np.asarray(self.initial_params.to_array(), dtype=np.float64).tobytes())
+        hasher.update(np.asarray(returns.index.view("i8"), dtype=np.int64).tobytes())
+        hasher.update(np.asarray(returns.values, dtype=np.float64).tobytes())
+        return hasher.hexdigest()
+
+    def _cache_path(self, returns: pd.Series, window: int) -> Optional[Path]:
+        """Retourne le chemin du cache rolling pour la série fournie."""
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.pkl"
+
+    @staticmethod
+    def _cache_columns() -> list[str]:
+        """Colonnes attendues pour le cache des paramètres rolling."""
+        return ["kappa", "theta", "xi", "rho", "mu"]
 
     # ------------------------------------------------------------------
     # Méthode interne : un pas predict-update avec mise à jour des matrices
@@ -472,7 +541,13 @@ class HestonUKF:
     # fit() — calibration MLE roulante
     # ------------------------------------------------------------------
 
-    def fit(self, log_returns: pd.Series, window: int = 252) -> "HestonUKF":
+    def fit(
+        self,
+        log_returns: pd.Series,
+        window: int = 252,
+        use_cache: bool = True,
+        save_every: int = 10,
+    ) -> "HestonUKF":
         """Calibre les paramètres de Heston par MLE sur la fenêtre roulante.
 
         On maximise log p(r_{t-W+1:t} | κ, θ, ξ, ρ, μ) via L-BFGS-B.
@@ -484,6 +559,9 @@ class HestonUKF:
         log_returns : pd.Series  Log-returns journaliers (index = dates).
         window      : int        Taille de la fenêtre roulante (défaut 252 = 1 an).
 
+        use_cache   : bool       Active le chargement / la sauvegarde sur disque.
+        save_every  : int        Fréquence de checkpoint du cache partiel.
+
         Retourne
         --------
         self  (chaînage de méthodes)
@@ -491,55 +569,134 @@ class HestonUKF:
         logging.info(
             "Fitting HestonUKF : n=%d observations, window=%d.", len(log_returns), window
         )
-        returns = log_returns.dropna().values
+        returns = log_returns.dropna()
         n = len(returns)
 
-        # Si la série est plus courte que la fenêtre, on utilise tout
-        if n < window:
-            logging.warning(
-                "Série trop courte (%d < %d). Fenêtre réduite à %d.", n, window, n
-            )
-            window = n
+        if n < 6:
+            raise ValueError("Au moins 6 observations sont nécessaires pour la calibration.")
 
-        # Point de départ de l'optimiseur : paramètres initiaux fournis
+        # Garder au moins une observation hors fenêtre pour filtrer sans look-ahead.
+        if n <= window:
+            new_window = n - 1
+            logging.warning(
+                "Série trop courte (%d <= %d). Fenêtre réduite à %d pour garder "
+                "une observation hors-fenêtre.",
+                n,
+                window,
+                new_window,
+            )
+            window = new_window
+
+        cache_path = self._cache_path(returns, window)
+        if use_cache and cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rolling_df: Optional[pd.DataFrame] = None
+        if use_cache and cache_path is not None and cache_path.exists():
+            try:
+                loaded = pd.read_pickle(cache_path)
+                if isinstance(loaded, pd.DataFrame) and all(
+                    col in loaded.columns for col in self._cache_columns()
+                ):
+                    rolling_df = loaded.sort_index()
+                    logging.info(
+                        "Cache rolling chargé depuis %s (%d lignes).",
+                        cache_path,
+                        len(rolling_df),
+                    )
+            except Exception as exc:
+                logging.warning("Impossible de charger le cache rolling %s (%s).", cache_path, exc)
+
         x0 = self.initial_params.to_array()
+        rolling_records: list[dict[str, float | pd.Timestamp]] = []
+        start_end = window
 
-        def neg_ll(x: np.ndarray) -> float:
-            p = HestonParams.from_array(x)
-            # Pénalité sur la condition de Feller : violation = max(0, ξ² − 2κθ)
-            # Si 2κθ < ξ², v_t peut devenir négatif → filtre instable
-            feller_violation = max(0.0, p.xi ** 2 - 2.0 * p.kappa * p.theta)
-            penalty = 1e4 * feller_violation
-            # On minimise le négatif de la log-vraisemblance (+ pénalité)
-            return -self._log_likelihood(p, returns[-window:]) + penalty
+        if rolling_df is not None and len(rolling_df) > 0:
+            valid_index = rolling_df.index.intersection(returns.index[window:])
+            if len(valid_index) > 0:
+                rolling_df = rolling_df.loc[valid_index]
+                rolling_records = [
+                    {"date": idx, **self._params_to_record(self._record_to_params(rolling_df.loc[idx]))}
+                    for idx in rolling_df.index
+                ]
+                last_cached_date = rolling_df.index[-1]
+                last_cached_pos = returns.index.get_loc(last_cached_date)
+                start_end = int(last_cached_pos) + 1
+                x0 = rolling_df.iloc[-1][self._cache_columns()].to_numpy(dtype=np.float64)
+                logging.info(
+                    "Reprise de la calibration rolling après %s.",
+                    last_cached_date,
+                )
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            # Optimiseur L-BFGS-B : adapté aux problèmes bornés avec gradient lisse
-            result = minimize(
-                neg_ll,
-                x0,
-                method="L-BFGS-B",
-                bounds=HestonParams.bounds(),
-                options={"maxiter": 300, "ftol": 1e-10, "gtol": 1e-7},
-            )
+        if start_end >= n and rolling_df is not None and len(rolling_df) == n - window:
+            self._rolling_params = rolling_df
+            self._params = self._record_to_params(self._rolling_params.iloc[-1])
+            logging.info("Calibration rolling entièrement restaurée depuis le cache.")
+            return self
 
-        # On accepte le résultat si convergé OU si meilleur que le point de départ
-        if result.success or (result.fun < neg_ll(x0)):
-            self._params = HestonParams.from_array(result.x)
-            logging.info(
-                "MLE convergé. kappa=%.3f theta=%.4f xi=%.3f rho=%.3f mu=%.4f",
-                self._params.kappa,
-                self._params.theta,
-                self._params.xi,
-                self._params.rho,
-                self._params.mu,
+        for end in range(start_end, n):
+            fit_date = returns.index[end]
+            sample = returns.iloc[end - window:end].values
+
+            def neg_ll(x: np.ndarray) -> float:
+                p = HestonParams.from_array(x)
+                feller_violation = max(0.0, p.xi ** 2 - 2.0 * p.kappa * p.theta)
+                penalty = 1e4 * feller_violation
+                return -self._log_likelihood(p, sample) + penalty
+
+            x_start = x0.copy()
+            start_obj = neg_ll(x_start)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = minimize(
+                    neg_ll,
+                    x_start,
+                    method="L-BFGS-B",
+                    bounds=HestonParams.bounds(),
+                    options={"maxiter": self.optimizer_maxiter, "ftol": 1e-10, "gtol": 1e-7},
+                )
+
+            if result.success or (result.fun < start_obj):
+                fitted = HestonParams.from_array(result.x)
+                x0 = result.x
+            else:
+                logging.warning(
+                    "MLE non convergé au %s (%s). Paramètres précédents conservés.",
+                    fit_date,
+                    result.message,
+                )
+                fitted = HestonParams.from_array(x_start)
+
+            row = {"date": fit_date}
+            row.update(self._params_to_record(fitted))
+            rolling_records.append(row)
+
+            should_checkpoint = (
+                use_cache
+                and cache_path is not None
+                and (
+                    len(rolling_records) % max(save_every, 1) == 0
+                    or end == n - 1
+                )
             )
-        else:
-            logging.warning(
-                "MLE non convergé (%s). Paramètres initiaux conservés.", result.message
-            )
-            self._params = self.initial_params
+            if should_checkpoint:
+                pd.DataFrame(rolling_records).set_index("date").to_pickle(cache_path)
+
+        self._rolling_params = pd.DataFrame(rolling_records).set_index("date")
+        if use_cache and cache_path is not None:
+            self._rolling_params.to_pickle(cache_path)
+        self._params = self._record_to_params(self._rolling_params.iloc[-1])
+        logging.info(
+            "Rolling MLE terminé : %d jeux de paramètres calibrés. Dernier jeu : "
+            "kappa=%.3f theta=%.4f xi=%.3f rho=%.3f mu=%.4f",
+            len(self._rolling_params),
+            self._params.kappa,
+            self._params.theta,
+            self._params.xi,
+            self._params.rho,
+            self._params.mu,
+        )
 
         return self
 
@@ -550,9 +707,9 @@ class HestonUKF:
     def filter(self, log_returns: pd.Series) -> pd.Series:
         """Estime la variance instantanée v̂_t par UKF sur toute la série.
 
-        À chaque pas, la correction ρ·ξ·v_t·Δt est injectée dans P_{xz}
-        via HestonUKFCore.update(), donnant le gain de Kalman exact sous
-        la dynamique de Heston avec Browniens corrélés.
+        Si fit() a produit une calibration rolling, chaque date t est filtrée
+        avec les paramètres calibrés sur la fenêtre [t-window, t), sans utiliser
+        le return du jour dans l'estimation des paramètres.
 
         Paramètres
         ----------
@@ -560,26 +717,42 @@ class HestonUKF:
 
         Retourne
         --------
-        pd.Series  Variance filtrée v̂_t (même index que log_returns).
+        pd.Series  Variance filtrée v̂_t sur les dates où les paramètres sont disponibles.
         """
         if self._params is None:
             raise RuntimeError("Appeler fit() avant filter().")
 
-        params = self._params
         returns = log_returns.dropna()
 
-        # Initialiser le filtre à theta (variance d'équilibre long terme)
-        v0 = max(params.theta, 1e-6)
-        ukf = _build_ukf_core(params, self.dt, v0)
+        if self._rolling_params is None:
+            params = self._params
+            v0 = max(params.theta, 1e-6)
+            ukf = _build_ukf_core(params, self.dt, v0)
+
+            v_estimates: list[float] = []
+            for r in returns.values:
+                v_upd, _ = self._step(ukf, params, float(r))
+                v_estimates.append(v_upd)
+
+            self._v_filtered = pd.Series(v_estimates, index=returns.index, name="v_hat")
+            return self._v_filtered
+
+        rolling_index = self._rolling_params.index.intersection(returns.index)
+        if len(rolling_index) == 0:
+            raise RuntimeError("Aucune date commune entre les paramètres rolling et les returns.")
+
+        first_params = self._record_to_params(self._rolling_params.loc[rolling_index[0]])
+        v0 = max(first_params.theta, 1e-6)
+        ukf = _build_ukf_core(first_params, self.dt, v0)
 
         v_estimates: list[float] = []
-        for r in returns.values:
-            # _step() : predict → update avec correction ρ et matrices Q, R state-dependent
-            v_upd, _ = self._step(ukf, params, float(r))
+        for date in rolling_index:
+            params = self._record_to_params(self._rolling_params.loc[date])
+            self._update_core_functions(ukf, params)
+            v_upd, _ = self._step(ukf, params, float(returns.loc[date]))
             v_estimates.append(v_upd)
 
-        # Stocker la série filtrée pour les propriétés dérivées (sigma_hat, spread)
-        self._v_filtered = pd.Series(v_estimates, index=returns.index, name="v_hat")
+        self._v_filtered = pd.Series(v_estimates, index=rolling_index, name="v_hat")
         return self._v_filtered
 
     # ------------------------------------------------------------------
@@ -621,6 +794,11 @@ class HestonUKF:
     def params(self) -> Optional[HestonParams]:
         """Paramètres calibrés par fit() (None si fit() non encore appelé)."""
         return self._params
+
+    @property
+    def rolling_params(self) -> Optional[pd.DataFrame]:
+        """Historique des paramètres calibrés date par date."""
+        return self._rolling_params
 
 
 # =============================================================================
@@ -718,8 +896,13 @@ class VolatilityTiming:
         self,
         df_positions: pd.DataFrame,
         signal: pd.Series,
+        lag_bdays: int = 1,
     ) -> pd.DataFrame:
         """Multiplie les poids de la stratégie par le signal de timing.
+
+        Le signal est décalé d'un jour ouvré par défaut : le poids appliqué à la
+        date t est donc construit à partir de l'information disponible en t-1.
+        Cela évite qu'une position prise à la date t utilise déjà r_t ou σ̂_t.
 
         Les dates sans signal disponible reçoivent un multiplicateur 1.0 (neutre),
         pour ne pas introduire de gaps dans la série de positions.
@@ -728,6 +911,7 @@ class VolatilityTiming:
         ----------
         df_positions : pd.DataFrame  Sortie de OptionTrade.generate_trades.
         signal       : pd.Series     Sortie de compute_signal (index = dates).
+        lag_bdays    : int           Décalage d'exécution en jours ouvrés.
 
         Retourne
         --------
@@ -735,9 +919,13 @@ class VolatilityTiming:
         """
         df = df_positions.copy()
 
+        signal_exec = signal.copy()
+        if lag_bdays > 0:
+            signal_exec.index = signal_exec.index + pd.offsets.BDay(lag_bdays)
+
         # Préparer le signal pour le merge (reset_index() car index = dates)
         signal_df = (
-            signal.rename("timing_signal")
+            signal_exec.rename("timing_signal")
             .reset_index()
             .rename(columns={"index": "date"})
         )
@@ -752,7 +940,11 @@ class VolatilityTiming:
         df["weight"] = df["weight"] * df["timing_signal"]
         df = df.drop(columns=["timing_signal"])
 
-        logging.info("Volatility timing appliqué à %d lignes.", len(df))
+        logging.info(
+            "Volatility timing appliqué à %d lignes avec un lag de %d jour(s) ouvré(s).",
+            len(df),
+            lag_bdays,
+        )
         return df
 
 
@@ -769,6 +961,7 @@ def build_timing_positions(
     lookback: int = 63,
     max_leverage: float = 2.0,
     threshold: float = 0.02,
+    signal_lag_bdays: int = 1,
     dt: float = 1.0 / 252.0,
     initial_params: Optional[HestonParams] = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
@@ -779,7 +972,7 @@ def build_timing_positions(
         2. HestonUKF.filter()                     estimation de v̂_t
         3. HestonUKF.implied_realized_spread()    calcul de s_t = σ_IV − σ̂_t
         4. VolatilityTiming.compute_signal()      normalisation du signal
-        5. VolatilityTiming.apply_timing()        application aux poids
+        5. VolatilityTiming.apply_timing()        application aux poids avec lag d'exécution
 
     Paramètres
     ----------
@@ -790,6 +983,7 @@ def build_timing_positions(
     scaling         : str           Mode de timing : "linear", "rank", "threshold".
     lookback        : int           Fenêtre de normalisation du signal (défaut 63).
     max_leverage    : float         Multiplicateur maximum |w_t / w_base| (défaut 2.0).
+    signal_lag_bdays: int           Lag d'exécution du signal (défaut 1 jour ouvré).
     dt              : float         Pas de temps en années (défaut 1/252).
     initial_params  : HestonParams  Point de départ MLE (défaut : valeurs typiques equity).
 
@@ -839,6 +1033,6 @@ def build_timing_positions(
         threshold=threshold, 
     )
     signal   = timer.compute_signal(spread)
-    df_timed = timer.apply_timing(df_positions, signal)
+    df_timed = timer.apply_timing(df_positions, signal, lag_bdays=signal_lag_bdays)
 
     return df_timed, spread, signal
