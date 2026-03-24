@@ -200,8 +200,8 @@ class HestonUKFCore:
             P_pred += Wc[i] * (d @ d.T)
         self.P = P_pred + self.Q
 
-        # Clamp : variance prédite strictement positive
-        self.x[0] = max(float(self.x[0]), 1e-8)
+        # Clamp : variance prédite strictement positive avec plancher numérique
+        self.x[0] = max(float(self.x[0]), 1e-6)
         self.P    = np.maximum(self.P, 1e-10 * np.eye(1))
 
         # Sauvegarder les sigma-points propagés pour update()
@@ -232,7 +232,7 @@ class HestonUKFCore:
         # S = Σ Wc_i · (h(σ_i) − ẑ)² + R_t
         zp = float(np.sum(Wm * sigmas_h.flatten()))
         S_val = float(np.sum(Wc * (sigmas_h.flatten() - zp) ** 2)) + float(self.R[0, 0])
-        S_val = max(S_val, 1e-12)
+        S_val = max(S_val, 1e-6)
 
         # --- Étape 3 : cross-covariance P_{xz} depuis les sigma-points ---
         # Cov(v_{t+1}, r_t) approchée par la transformée non-parfumée seule
@@ -248,11 +248,12 @@ class HestonUKFCore:
         Pxz += self._rho_xi_vt_dt
 
         # --- Étape 5 : gain de Kalman K = P_{xz} / S ---
-        K = Pxz / S_val
+        # Clipping défensif pour éviter les explosions numériques quand v_t approche 0
+        K = np.clip(Pxz / S_val, -20.0, 20.0)
 
         # --- Étape 6 : mise à jour état et covariance ---
         innovation = float(z) - zp
-        self.x[0] = max(float(self.x[0]) + K * innovation, 1e-8)
+        self.x[0] = max(float(self.x[0]) + K * innovation, 1e-6)
         self.P[0, 0] = max(self.P[0, 0] - K * S_val * K, 1e-10)
 
         # Sauvegarde pour diagnostics (log-vraisemblance)
@@ -296,11 +297,11 @@ def _build_ukf_core(params: HestonParams, dt: float, v0: float) -> HestonUKFCore
     # La partie stochastique (ξ√v_t dW_2) est capturée par Q_t = ξ²v_t Δt.
     # ------------------------------------------------------------------
     def fx(v: np.ndarray, dt: float) -> np.ndarray:
-        v_val = max(float(v[0]), 1e-8)
+        v_val = max(float(v[0]), 1e-6)
         # Drift de mean-reversion : κ pousse v_t vers θ
         v_next = v_val + params.kappa * (params.theta - v_val) * dt
         # Clamp : la variance ne peut pas être négative (propriété de Heston)
-        return np.array([max(v_next, 1e-8)])
+        return np.array([max(v_next, 1e-6)])
 
     # ------------------------------------------------------------------
     # Fonction d'observation h(v_t) — espérance du log-return
@@ -310,7 +311,7 @@ def _build_ukf_core(params: HestonParams, dt: float, v0: float) -> HestonUKFCore
     # Le terme −v_t/2 est la correction d'Itô (convexity adjustment).
     # ------------------------------------------------------------------
     def hx(v: np.ndarray) -> np.ndarray:
-        v_val = max(float(v[0]), 1e-8)
+        v_val = max(float(v[0]), 1e-6)
         # Correction d'Itô : l'espérance du log-return dépend de v_t
         return np.array([(params.mu - 0.5 * v_val) * dt])
 
@@ -467,7 +468,7 @@ class HestonUKF:
         innov_ll  : float  Contribution à la log-vraisemblance (innovation).
         """
         # Variance courante (avant predict) — clampée pour stabilité numérique
-        v_pred = max(float(ukf.x[0]), 1e-8)
+        v_pred = max(float(ukf.x[0]), 1e-6)
 
         # Mise à jour du bruit de processus Q_t = ξ² v_t Δt
         # (bruit multiplicatif : Q dépend de l'état courant v_t)
@@ -497,7 +498,7 @@ class HestonUKF:
         # Diagnostics venant du filtre
         innovation = float(ukf._innovation)
         innovation_var = float(ukf.S[0, 0]) if ukf.S is not None else v_pred * self.dt
-        innovation_var = max(innovation_var, 1e-12)
+        innovation_var = max(innovation_var, 1e-6)
         std_innovation = innovation / np.sqrt(innovation_var)
         kalman_gain = float(ukf.K[0, 0]) if ukf.K is not None else np.nan
 
@@ -505,7 +506,7 @@ class HestonUKF:
         # log p(r_t | F_{t-1}) = −½ [log(2π S_t) + ν_t² / S_t]
         innov_ll = -0.5 * (np.log(2.0 * np.pi * innovation_var) + innovation ** 2 / innovation_var)
 
-        v_updated = max(float(ukf.x[0]), 1e-8)
+        v_updated = max(float(ukf.x[0]), 1e-6)
         sigma_updated = np.sqrt(v_updated)
         return {
             "v_hat": v_updated,
@@ -914,10 +915,10 @@ class HestonUKF:
         if p is None:
             raise RuntimeError("Paramètres non calibrés.")
 
-        v_t = max(float(v_t), 1e-8)
+        v_t = max(float(v_t), 1e-6)
         tau = horizon * self.dt
         v_forecast = p.theta + (v_t - p.theta) * np.exp(-p.kappa * tau)
-        return max(float(v_forecast), 1e-8)
+        return max(float(v_forecast), 1e-6)
     
     # ------------------------------------------------------------------
     # forecast_average_variance() — forecast moyenne de variance
@@ -934,7 +935,7 @@ class HestonUKF:
         if p is None:
             raise RuntimeError("Paramètres non calibrés.")
 
-        v_t = max(float(v_t), 1e-8)
+        v_t = max(float(v_t), 1e-6)
         tau = horizon * self.dt
 
         if p.kappa < 1e-10:
@@ -942,7 +943,7 @@ class HestonUKF:
         else:
             decay_term = (1.0 - np.exp(-p.kappa * tau)) / (p.kappa * tau)
             v_avg = p.theta + (v_t - p.theta) * decay_term
-        return max(float(v_avg), 1e-8)
+        return max(float(v_avg), 1e-6)
     
     # ----------------------------------------------------------------------------
     # forecast_average_volatility() — helper pour forecast moyenne de volatilité
