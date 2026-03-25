@@ -46,6 +46,7 @@ class DataLoader(ABC):
             load_kwargs,
         )
         df = cls._EXTENSION_TO_LOADER[extension](file_path, **(load_kwargs or {}))
+        df["date"] = pd.to_datetime(df["date"], format="mixed")
         df["date"] = df["date"].astype("datetime64[ns]")
         logging.info("Processing with %s", process_kwargs)
         logging.info("Potentially add extra field with %s", extra_fields_kwargs)

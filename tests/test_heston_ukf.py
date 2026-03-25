@@ -66,7 +66,20 @@ def test_filter_with_rolling_params_returns_series_aligned_on_rolling_index(monk
 
     monkeypatch.setattr("investment_lab.heston_ukf._build_ukf_core", lambda *args, **kwargs: object())
     monkeypatch.setattr(ukf, "_update_core_functions", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ukf, "_step", lambda _core, params, _r: (params.theta, 0.0))
+    monkeypatch.setattr(
+        ukf,
+        "_step",
+        lambda _core, params, _r: {
+            "v_hat": params.theta,
+            "sigma_hat": np.sqrt(params.theta),
+            "expected_return": 0.0,
+            "innovation": 0.0,
+            "innovation_var": 1.0,
+            "std_innovation": 0.0,
+            "kalman_gain": 0.0,
+            "loglik": 0.0,
+        },
+    )
 
     v_hat = ukf.filter(returns)
 
@@ -147,3 +160,64 @@ def test_build_timing_positions_propagates_signal_lag(monkeypatch):
     assert spread.name == "iv_rv_spread"
     assert signal.name == "timing_signal"
     assert (df_timed["weight"] == 2.0).all()
+
+
+def test_log_likelihood_uses_step_diagnostics(monkeypatch):
+    ukf = HestonUKF(initial_params=HestonParams())
+    params = HestonParams()
+    sample = np.array([0.01, -0.02, 0.015, 0.005, -0.01])
+
+    monkeypatch.setattr("investment_lab.heston_ukf._build_ukf_core", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        ukf,
+        "_step",
+        lambda _core, _params, _r: {
+            "v_hat": 0.04,
+            "sigma_hat": 0.2,
+            "expected_return": 0.0,
+            "innovation": 0.0,
+            "innovation_var": 1.0,
+            "std_innovation": 0.0,
+            "kalman_gain": 0.0,
+            "loglik": -1.5,
+        },
+    )
+
+    ll = ukf._log_likelihood(params, sample)
+    assert ll == pytest.approx(-1.5 * len(sample))
+
+
+def test_fit_stores_rolling_window_diagnostics(monkeypatch):
+    idx = pd.bdate_range("2024-01-01", periods=8)
+    returns = pd.Series(np.linspace(-0.02, 0.02, len(idx)), index=idx)
+
+    class DummyResult:
+        success = True
+        fun = 1.0
+        status = 0
+        message = "ok"
+        nfev = 3
+        nit = 2
+        x = np.array([1.5, 0.05, 0.25, -0.6, 0.01])
+
+    monkeypatch.setattr(
+        "investment_lab.heston_ukf.minimize",
+        lambda *args, **kwargs: DummyResult(),
+    )
+    monkeypatch.setattr(
+        HestonUKF,
+        "_log_likelihood",
+        lambda self, params, sample: float(np.sum(sample)),
+    )
+
+    ukf = HestonUKF(initial_params=HestonParams(), cache_dir=None)
+    ukf.fit(returns, window=3, use_cache=False)
+
+    diag = ukf.fit_diagnostics
+    assert len(diag) == len(returns) - 3
+    assert {"window_start", "window_end", "window_size", "start_loglik", "final_loglik"}.issubset(diag.columns)
+    assert (diag["window_size"] == 3).all()
+    assert diag.index.min() == idx[3]
+    assert diag.loc[idx[3], "window_start"] == idx[0]
+    assert diag.loc[idx[3], "window_end"] == idx[2]
+    assert bool(diag.loc[idx[3], "optimizer_success"]) is True
