@@ -437,12 +437,54 @@ class HestonUKF:
         """Retourne le chemin du cache rolling pour la série fournie."""
         if self.cache_dir is None:
             return None
+        return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.parquet"
+
+    def _legacy_cache_path(self, returns: pd.Series, window: int) -> Optional[Path]:
+        """Retourne l'ancien chemin pickle pour compatibilité ascendante."""
+        if self.cache_dir is None:
+            return None
         return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.pkl"
 
     @staticmethod
     def _cache_columns() -> list[str]:
         """Colonnes de paramètres attendues dans le cache rolling."""
         return ["kappa", "theta", "xi", "rho", "mu"]
+
+    def _load_cache_frame(self, returns: pd.Series, window: int) -> tuple[Optional[pd.DataFrame], Optional[Path]]:
+        """Charge un artefact rolling depuis parquet, ou pickle en secours."""
+        cache_path = self._cache_path(returns, window)
+        legacy_cache_path = self._legacy_cache_path(returns, window)
+
+        candidates = [path for path in [cache_path, legacy_cache_path] if path is not None and path.exists()]
+        for path in candidates:
+            try:
+                if path.suffix == ".parquet":
+                    loaded = pd.read_parquet(path)
+                else:
+                    loaded = pd.read_pickle(path)
+
+                if not isinstance(loaded, pd.DataFrame):
+                    continue
+                if not all(col in loaded.columns for col in self._cache_columns()):
+                    continue
+
+                if "date" in loaded.columns:
+                    loaded["date"] = pd.to_datetime(loaded["date"], errors="coerce")
+                    loaded = loaded.set_index("date")
+
+                loaded.index = pd.to_datetime(loaded.index, errors="coerce")
+                loaded = loaded.loc[loaded.index.notna()].sort_index()
+                return loaded, path
+            except Exception as exc:
+                logging.warning("Impossible de charger le cache rolling %s (%s).", path, exc)
+
+        return None, cache_path
+
+    @staticmethod
+    def _save_cache_frame(df: pd.DataFrame, path: Path) -> None:
+        """Sauvegarde l'artefact rolling dans un parquet versionnable."""
+        export_df = df.reset_index()
+        export_df.to_parquet(path, index=False)
 
     # ------------------------------------------------------------------
     # Méthode interne : un pas predict-update avec mise à jour des matrices
@@ -616,20 +658,15 @@ class HestonUKF:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
 
         rolling_df: Optional[pd.DataFrame] = None
-        if use_cache and cache_path is not None and cache_path.exists():
-            try:
-                loaded = pd.read_pickle(cache_path)
-                if isinstance(loaded, pd.DataFrame) and all(
-                    col in loaded.columns for col in self._cache_columns()
-                ):
-                    rolling_df = loaded.sort_index()
-                    logging.info(
-                        "Cache rolling chargé depuis %s (%d lignes).",
-                        cache_path,
-                        len(rolling_df),
-                    )
-            except Exception as exc:
-                logging.warning("Impossible de charger le cache rolling %s (%s).", cache_path, exc)
+        loaded_from: Optional[Path] = None
+        if use_cache and cache_path is not None:
+            rolling_df, loaded_from = self._load_cache_frame(returns, window)
+            if rolling_df is not None:
+                logging.info(
+                    "Artefact rolling chargé depuis %s (%d lignes).",
+                    loaded_from,
+                    len(rolling_df),
+                )
 
         x0 = self.initial_params.to_array()
         rolling_records: list[dict[str, float | pd.Timestamp]] = []
@@ -795,12 +832,18 @@ class HestonUKF:
             if should_checkpoint:
                 rolling_params_df = pd.DataFrame(rolling_records).set_index("date")
                 diagnostics_df = pd.DataFrame(diagnostics_records).set_index("date")
-                rolling_params_df.join(diagnostics_df, how="left").to_pickle(cache_path)
+                self._save_cache_frame(
+                    rolling_params_df.join(diagnostics_df, how="left"),
+                    cache_path,
+                )
 
         self._rolling_params = pd.DataFrame(rolling_records).set_index("date")
         self._fit_diagnostics = pd.DataFrame(diagnostics_records).set_index("date")
         if use_cache and cache_path is not None:
-            self._rolling_params.join(self._fit_diagnostics, how="left").to_pickle(cache_path)
+            self._save_cache_frame(
+                self._rolling_params.join(self._fit_diagnostics, how="left"),
+                cache_path,
+            )
         self._params = self._record_to_params(self._rolling_params.iloc[-1])
         logging.info(
             "Rolling MLE terminé : %d jeux de paramètres calibrés. Dernier jeu : "

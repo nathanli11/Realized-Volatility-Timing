@@ -221,3 +221,48 @@ def test_fit_stores_rolling_window_diagnostics(monkeypatch):
     assert diag.loc[idx[3], "window_start"] == idx[0]
     assert diag.loc[idx[3], "window_end"] == idx[2]
     assert bool(diag.loc[idx[3], "optimizer_success"]) is True
+
+
+def test_fit_restores_fully_from_parquet_artifact(tmp_path, monkeypatch):
+    idx = pd.bdate_range("2024-01-01", periods=8)
+    returns = pd.Series(np.linspace(-0.02, 0.02, len(idx)), index=idx)
+
+    ukf = HestonUKF(initial_params=HestonParams(), cache_dir=tmp_path)
+    cache_path = ukf._cache_path(returns, window=3)
+    assert cache_path is not None
+
+    artifact = pd.DataFrame(
+        {
+            "date": idx[3:],
+            "kappa": [1.1] * 5,
+            "theta": [0.04] * 5,
+            "xi": [0.3] * 5,
+            "rho": [-0.7] * 5,
+            "mu": [0.01] * 5,
+            "window_start": idx[:5],
+            "window_end": idx[2:7],
+            "window_size": [3] * 5,
+            "start_loglik": [-10.0] * 5,
+            "final_loglik": [-8.0] * 5,
+            "loglik_improvement": [2.0] * 5,
+            "feller_violation": [0.0] * 5,
+            "objective_value": [8.0] * 5,
+            "optimizer_success": [True] * 5,
+            "optimizer_status": [0] * 5,
+            "optimizer_message": ["ok"] * 5,
+            "nfev": [3] * 5,
+            "nit": [2] * 5,
+        }
+    )
+    artifact.to_parquet(cache_path, index=False)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("minimize should not be called when the parquet artifact is complete")
+
+    monkeypatch.setattr("investment_lab.heston_ukf.minimize", fail_if_called)
+
+    ukf.fit(returns, window=3, use_cache=True)
+
+    assert ukf.rolling_params.index.equals(idx[3:])
+    assert ukf.fit_diagnostics.index.equals(idx[3:])
+    assert ukf.params.kappa == pytest.approx(1.1)
