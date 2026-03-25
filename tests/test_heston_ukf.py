@@ -266,3 +266,26 @@ def test_fit_restores_fully_from_parquet_artifact(tmp_path, monkeypatch):
     assert ukf.rolling_params.index.equals(idx[3:])
     assert ukf.fit_diagnostics.index.equals(idx[3:])
     assert ukf.params.kappa == pytest.approx(1.1)
+
+
+def test_cache_path_is_human_readable_and_stable():
+    idx = pd.bdate_range("2024-01-01", periods=5)
+    returns = pd.Series(np.linspace(-0.01, 0.01, len(idx)), index=idx)
+
+    ukf = HestonUKF(initial_params=HestonParams(), cache_dir=Path("/tmp"))
+    cache_path = ukf._cache_path(returns, window=3)
+
+    assert cache_path is not None
+    assert cache_path.name.startswith("rolling_window3_n5_20240101_20240105_")
+    assert cache_path.suffix == ".parquet"
+
+
+def test_cache_path_can_include_artifact_label():
+    idx = pd.bdate_range("2024-01-01", periods=5)
+    returns = pd.Series(np.linspace(-0.01, 0.01, len(idx)), index=idx)
+
+    ukf = HestonUKF(initial_params=HestonParams(), cache_dir=Path("/tmp"), artifact_label="SPY")
+    cache_path = ukf._cache_path(returns, window=3)
+
+    assert cache_path is not None
+    assert cache_path.name.startswith("spy_rolling_window3_n5_20240101_20240105_")

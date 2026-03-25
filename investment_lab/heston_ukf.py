@@ -364,6 +364,7 @@ class HestonUKF:
         initial_params: Optional[HestonParams] = None,
         dt: float = 1.0 / 252.0,
         cache_dir: Optional[str | Path] = ".cache/heston_ukf",
+        artifact_label: Optional[str] = None,
         optimizer_maxiter: int = 300,
     ) -> None:
         # Point de départ de l'optimiseur (valeurs typiques equity si non fourni)
@@ -372,6 +373,8 @@ class HestonUKF:
         self.dt = dt
         # Répertoire de cache pour les calibrations rolling
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        # Libellé optionnel pour rendre le nom des artefacts plus parlant (ex: ticker)
+        self.artifact_label = self._sanitize_artifact_label(artifact_label)
         # Nombre maximal d'itérations pour L-BFGS-B
         self.optimizer_maxiter = optimizer_maxiter
         # Paramètres calibrés (None tant que fit() n'a pas été appelé)
@@ -433,8 +436,38 @@ class HestonUKF:
         hasher.update(np.asarray(returns.values, dtype=np.float64).tobytes())
         return hasher.hexdigest()
 
+    @staticmethod
+    def _sanitize_artifact_label(label: Optional[str]) -> Optional[str]:
+        """Normalise un libellé libre pour l'utiliser dans un nom de fichier."""
+        if label is None:
+            return None
+        sanitized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(label).strip())
+        sanitized = "_".join(part for part in sanitized.split("_") if part)
+        return sanitized or None
+
+    def _cache_label(self, returns: pd.Series, window: int) -> str:
+        """Construit un libellé lisible pour les artefacts rolling."""
+        clean_returns = returns.dropna()
+        if len(clean_returns) == 0:
+            base_label = f"rolling_window{window}_empty"
+            return f"{self.artifact_label}_{base_label}" if self.artifact_label else base_label
+
+        start = pd.Timestamp(clean_returns.index.min()).strftime("%Y%m%d")
+        end = pd.Timestamp(clean_returns.index.max()).strftime("%Y%m%d")
+        n_obs = len(clean_returns)
+        base_label = f"rolling_window{window}_n{n_obs}_{start}_{end}"
+        return f"{self.artifact_label}_{base_label}" if self.artifact_label else base_label
+
     def _cache_path(self, returns: pd.Series, window: int) -> Optional[Path]:
         """Retourne le chemin du cache rolling pour la série fournie."""
+        if self.cache_dir is None:
+            return None
+        label = self._cache_label(returns, window)
+        key = self._cache_key(returns, window)
+        return self.cache_dir / f"{label}_{key}.parquet"
+
+    def _legacy_parquet_path(self, returns: pd.Series, window: int) -> Optional[Path]:
+        """Retourne l'ancien chemin parquet basé uniquement sur le hash."""
         if self.cache_dir is None:
             return None
         return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.parquet"
@@ -453,9 +486,14 @@ class HestonUKF:
     def _load_cache_frame(self, returns: pd.Series, window: int) -> tuple[Optional[pd.DataFrame], Optional[Path]]:
         """Charge un artefact rolling depuis parquet, ou pickle en secours."""
         cache_path = self._cache_path(returns, window)
+        legacy_parquet_path = self._legacy_parquet_path(returns, window)
         legacy_cache_path = self._legacy_cache_path(returns, window)
 
-        candidates = [path for path in [cache_path, legacy_cache_path] if path is not None and path.exists()]
+        candidates = [
+            path
+            for path in [cache_path, legacy_parquet_path, legacy_cache_path]
+            if path is not None and path.exists()
+        ]
         for path in candidates:
             try:
                 if path.suffix == ".parquet":

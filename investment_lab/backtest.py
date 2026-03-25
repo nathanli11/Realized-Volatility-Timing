@@ -53,7 +53,7 @@ class StrategyBacktester:
         df_positions["dt"] = 1
 
         logging.info("Append previous period greeks for P&L calculations.")
-        # Correctif : utiliser .bfill() au lieu du fillna(method="bfill") déprécié
+        # Correctif : utilisation de .bfill() 
         df_positions["prev_theta"] = df_positions.groupby("option_id")["theta"].shift(1).bfill()
         df_positions["prev_gamma"] = df_positions.groupby("option_id")["gamma"].shift(1).bfill()
         df_positions["prev_delta"] = df_positions.groupby("option_id")["delta"].shift(1).bfill()
@@ -153,7 +153,6 @@ class StrategyBacktester:
         tickers = df_positions_cp["ticker"].unique().tolist()
         df_options = OptionLoader.load_data(start, end, process_kwargs={"ticker": tickers})
 
-        # Ligne spot synthétique pour valoriser correctement les jambes de couverture delta
         df_spot = (
             df_options.groupby(["date", "ticker"])
             .apply(
@@ -174,7 +173,7 @@ class StrategyBacktester:
         df_positions_extended = df_positions_cp.merge(
             df_options_spot, how="left", on=["ticker", "option_id", "date"]
         )
-        # Suppression des lignes postérieures à l’échéance (sauf les lignes spot / couverture delta avec expiration = NaT)
+        # Suppression des lignes postérieures à l’échéance
         df_positions_extended = df_positions_extended[
             (df_positions_extended["date"] <= df_positions_extended["expiration"])
             | df_positions_extended["expiration"].isna()
@@ -259,7 +258,7 @@ class BacktesterFixedRelativeBidAsk(StrategyBacktester):
         **kwargs,
     ) -> pd.DataFrame:
         logging.info(
-            "Application d’un demi-spread relatif fixe de %.2f%% aux dates de transaction.",
+            "Application d’un demi-spread relatif fixe aux dates de transaction.",
             relative_half_spread * 100,
         )
         df_cp = df_positions.copy()
