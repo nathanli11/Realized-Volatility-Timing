@@ -58,6 +58,12 @@ import warnings
 from pathlib import Path
 from typing import Optional
 
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -170,7 +176,7 @@ class HestonUKF:
         """Retourne le chemin du cache rolling pour la série fournie."""
         if self.cache_dir is None:
             return None
-        return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.pkl"
+        return self.cache_dir / f"rolling_{self._cache_key(returns, window)}.parquet"
 
     @staticmethod
     def _cache_columns() -> list[str]:
@@ -351,7 +357,7 @@ class HestonUKF:
         rolling_df: Optional[pd.DataFrame] = None
         if use_cache and cache_path is not None and cache_path.exists():
             try:
-                loaded = pd.read_pickle(cache_path)
+                loaded = pd.read_parquet(cache_path)
                 if isinstance(loaded, pd.DataFrame) and all(
                     col in loaded.columns for col in self._cache_columns()
                 ):
@@ -432,7 +438,20 @@ class HestonUKF:
             logging.info("Calibration rolling entièrement restaurée depuis le cache.")
             return self
 
-        for end in range(start_end, n):
+        total_steps = n - start_end
+        already_done = start_end - window
+        iterator = range(start_end, n)
+        if _HAS_TQDM and total_steps > 0:
+            iterator = _tqdm(
+                iterator,
+                total=total_steps,
+                initial=0,
+                desc=f"Heston MLE rolling (w={window})",
+                unit="day",
+                postfix={"done": already_done, "total": n - window},
+            )
+
+        for end in iterator:
             fit_date = returns.index[end]
             sample_series = returns.iloc[end - window:end]
             sample = sample_series.values
@@ -528,12 +547,12 @@ class HestonUKF:
             if should_checkpoint:
                 rolling_params_df = pd.DataFrame(rolling_records).set_index("date")
                 diagnostics_df = pd.DataFrame(diagnostics_records).set_index("date")
-                rolling_params_df.join(diagnostics_df, how="left").to_pickle(cache_path)
+                rolling_params_df.join(diagnostics_df, how="left").to_parquet(cache_path)
 
         self._rolling_params = pd.DataFrame(rolling_records).set_index("date")
         self._fit_diagnostics = pd.DataFrame(diagnostics_records).set_index("date")
         if use_cache and cache_path is not None:
-            self._rolling_params.join(self._fit_diagnostics, how="left").to_pickle(cache_path)
+            self._rolling_params.join(self._fit_diagnostics, how="left").to_parquet(cache_path)
         self._params = self._record_to_params(self._rolling_params.iloc[-1])
         logging.info(
             "Rolling MLE terminé : %d jeux de paramètres calibrés. Dernier jeu : "

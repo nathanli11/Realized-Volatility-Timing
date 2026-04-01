@@ -62,7 +62,7 @@ def drawdown(returns: pd.Series) -> pd.Series:
     Returns:
         Series of drawdowns.
     """
-    nav = returns_to_levels(returns)
+    nav = returns_to_levels(returns, method="simple")
     return (nav / nav.cummax()) - 1
 
 
