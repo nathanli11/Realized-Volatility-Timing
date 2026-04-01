@@ -9,13 +9,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from investment_lab.heston_ukf import (
-    HestonParams,
-    HestonUKF,
-    VolatilityTiming,
-    build_timing_positions,
-)
-
+from investment_lab.stochastic.heston_ukf import HestonUKF
+from investment_lab.stochastic.heston import HestonParams
+from investment_lab.metrics.signal import VolatilityTiming
+from investment_lab.timing import build_timing_positions
 
 def test_compute_signal_linear_is_bounded_and_keeps_index():
     idx = pd.bdate_range("2024-01-01", periods=8)
@@ -64,7 +61,7 @@ def test_filter_with_rolling_params_returns_series_aligned_on_rolling_index(monk
         index=idx[-3:],
     )
 
-    monkeypatch.setattr("investment_lab.heston_ukf._build_ukf_core", lambda *args, **kwargs: object())
+    monkeypatch.setattr("investment_lab.stochastic.heston_ukf.build_ukf_core", lambda *args, **kwargs: object())
     monkeypatch.setattr(ukf, "_update_core_functions", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         ukf,
@@ -167,7 +164,7 @@ def test_log_likelihood_uses_step_diagnostics(monkeypatch):
     params = HestonParams()
     sample = np.array([0.01, -0.02, 0.015, 0.005, -0.01])
 
-    monkeypatch.setattr("investment_lab.heston_ukf._build_ukf_core", lambda *args, **kwargs: object())
+    monkeypatch.setattr("investment_lab.stochastic.heston_ukf.build_ukf_core", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         ukf,
         "_step",
@@ -201,7 +198,7 @@ def test_fit_stores_rolling_window_diagnostics(monkeypatch):
         x = np.array([1.5, 0.05, 0.25, -0.6, 0.01])
 
     monkeypatch.setattr(
-        "investment_lab.heston_ukf.minimize",
+        "investment_lab.stochastic.heston_ukf.minimize",
         lambda *args, **kwargs: DummyResult(),
     )
     monkeypatch.setattr(

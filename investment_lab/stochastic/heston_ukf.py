@@ -55,282 +55,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from numpy import dot
-from numpy.linalg import inv
 import pandas as pd
 from scipy.optimize import minimize
 
-try:
-    # On utilise uniquement MerweScaledSigmaPoints — l'API publique stable de filterpy.
-    # UnscentedKalmanFilter n'est pas importé pour éviter les attributs internes
-    # instables (_UT, _num_sigmas, sigmas_f) qui varient selon la version installée.
-    from filterpy.kalman import MerweScaledSigmaPoints
-except ImportError as exc:
-    raise ImportError("filterpy est requis : pip install filterpy") from exc
-
-
-
-# HestonParams — dataclass des parametres
-@dataclass
-class HestonParams:
-    """Parametres du modèle de Heston.
-
-    kappa : float  Vitesse de retour à la moyenne de v_t.     
-    theta : float  Variance long terme (moyenne de v_t).      
-    xi    : float  Volatilité de la variance (vol-of-vol).    
-    rho   : float  Corrélation dW_1 / dW_2.                 
-    mu    : float  Drift du log-prix.                       
-    """
-
-    # De facon arbitraire
-    kappa: float = 2.0
-    theta: float = 0.04
-    xi:    float = 0.3
-    rho:   float = -0.7
-    mu:    float = 0.0
-
-    def feller_satisfied(self) -> bool:
-        """Condition de Feller : 2κθ > ξ²  →  v_t reste strictement positif."""
-        return 2.0 * self.kappa * self.theta > self.xi ** 2
-
-    def to_array(self) -> np.ndarray:
-        """Series des 5 paramètres en vecteur numpy pour l'optimiseur."""
-        return np.array([self.kappa, self.theta, self.xi, self.rho, self.mu])
-
-    @classmethod
-    def from_array(cls, x: np.ndarray) -> "HestonParams":
-        """Désérialise un vecteur numpy en HestonParams."""
-        return cls(kappa=x[0], theta=x[1], xi=x[2], rho=x[3], mu=x[4])
-
-    @staticmethod
-    def bounds() -> list[tuple]:
-        """Bornes pour L-BFGS-B —."""
-        return [
-            (1e-3, 20.0),        # kappa  : retour à la moyenne positif
-            (1e-4,  1.0),        # theta  : variance long terme > 0
-            (1e-3,  5.0),        # xi     : vol-of-vol positif
-            (-0.999, 0.999),     # rho    : corrélation strictement dans (−1, 1)
-            (-1.0,   1.0),       # mu     : drift borné
-        ]
-
-
-
-# HestonUKFCore — implémentation autonome du UKF Heston
-#
-# On n'hérite PAS de filterpy.UnscentedKalmanFilter pour rester indépendant
-# de ses attributs internes (_UT, _num_sigmas, sigmas_f…) dont les noms
-# varient selon la version installée.
-# On utilise uniquement MerweScaledSigmaPoints (API publique stable) pour
-# calculer les sigma-points et leurs poids, puis on implémente le cycle
-# predict / update à la main — 20 lignes, zéro attribut privé.
-
-class HestonUKFCore:
-    """UKF de Heston entièrement autonome avec correction ρ·ξ·v_t·Δt.
-
-    Seule dépendance filterpy : MerweScaledSigmaPoints (API publique stable).
-    Toute la logique predict / update est réimplémentée ici sans recourir à
-    aucun attribut interne de UnscentedKalmanFilter (_UT, sigmas_f, etc.).
-
-    Attributs principaux
-    --------------------
-    x  : np.ndarray (1,)   État courant v̂_t
-    P  : np.ndarray (1,1)  Covariance de l'état
-    Q  : np.ndarray (1,1)  Bruit de processus  (mis à jour à chaque step)
-    R  : np.ndarray (1,1)  Bruit de mesure     (mis à jour à chaque step)
-    S  : np.ndarray (1,1)  Covariance d'innovation (après update)
-    K  : np.ndarray (1,1)  Gain de Kalman      (après update)
-    _rho_xi_vt_dt : float  Correction ρ·ξ·v_t·Δt (mis à jour à chaque step)
-    """
-
-    def __init__(self, fx, hx, x0: float, P0: float, Q0: float, R0: float,
-                 dt: float, alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0):
-        # Fonctions d'état et d'observation
-        self.fx = fx
-        self.hx = hx
-        self.dt = dt
-
-        # État initial et covariance
-        self.x = np.array([x0])
-        self.P = np.array([[P0]])
-
-        # Matrices de bruit (state-dependent — mises à jour dans _step())
-        self.Q = np.array([[Q0]])
-        self.R = np.array([[R0]])
-
-        # Correction ρ — mise à jour dans _step() avant chaque update()
-        self._rho_xi_vt_dt: float = 0.0
-
-        # Diagnostics
-        self.S  = np.array([[R0]])
-        self.K  = np.zeros((1, 1))
-        self._innovation: float = 0.0
-        self.zp: float = 0.0
-
-        # Générateur de sigma-points Merwe — seule API filterpy utilisée
-        # alpha=1e-3 : points proches de la moyenne (évite v_t < 0)
-        # beta=2     : optimal pour gaussienne
-        # kappa=0    : standard pour n=1
-        self._sp = MerweScaledSigmaPoints(n=1, alpha=alpha, beta=beta, kappa=kappa)
-
-    def predict(self) -> None:
-        """Étape de prédiction : propage les sigma-points à travers fx.
-
-        v̂_{t|t-1} = Σ Wm_i · f(σ_i)
-        P_{t|t-1}  = Σ Wc_i · (f(σ_i) − v̂)² + Q_t
-        """
-        # Génération des 2n+1 = 3 sigma-points autour de l'état courant
-        sigmas = self._sp.sigma_points(self.x, self.P)
-        Wm, Wc = self._sp.Wm, self._sp.Wc
-
-        # Propagation déterministe à travers f (drift de Heston)
-        sigmas_f = np.array([self.fx(s, self.dt) for s in sigmas])
-
-        # Moyenne prédite : v̂_{t|t-1}
-        self.x = np.sum(Wm[:, None] * sigmas_f, axis=0)
-
-        # Covariance prédite : P_{t|t-1} + Q_t
-        P_pred = np.zeros((1, 1))
-        for i in range(len(Wm)):
-            d = (sigmas_f[i] - self.x).reshape(-1, 1)
-            P_pred += Wc[i] * (d @ d.T)
-        self.P = P_pred + self.Q
-
-        # Clamp : variance prédite strictement positive avec plancher numérique
-        self.x[0] = max(float(self.x[0]), 1e-6)
-        self.P    = np.maximum(self.P, 1e-10 * np.eye(1))
-
-        # Sauvegarder les sigma-points propagés pour update()
-        self._sigmas_f = sigmas_f
-        self._Wm = Wm
-        self._Wc = Wc
-
-    def update(self, z: float) -> None:
-        """Étape de mise à jour avec correction ρ·ξ·v_t·Δt dans P_{xz}.
-
-        Étapes :
-          1. Propager les sigma-points prédits à travers hx
-          2. Calculer ẑ et S (covariance d'innovation)
-          3. Calculer P_{xz} depuis les sigma-points
-          4. AJOUTER la correction ρ·ξ·v_t·Δt à P_{xz}
-          5. Gain de Kalman K = P_{xz} · S⁻¹
-          6. Mise à jour de x et P
-        """
-        sigmas_f = self._sigmas_f
-        Wm, Wc   = self._Wm, self._Wc
-
-        # --- Étape 1 : sigma-points dans l'espace d'observation ---
-        # h(σ_i) = E[r_t | σ_i] = (μ − σ_i/2) Δt
-        sigmas_h = np.array([self.hx(s) for s in sigmas_f])
-
-        # --- Étape 2 : moyenne prédite ẑ et covariance d'innovation S ---
-        # ẑ = Σ Wm_i · h(σ_i)
-        # S = Σ Wc_i · (h(σ_i) − ẑ)² + R_t
-        zp = float(np.sum(Wm * sigmas_h.flatten()))
-        S_val = float(np.sum(Wc * (sigmas_h.flatten() - zp) ** 2)) + float(self.R[0, 0])
-        S_val = max(S_val, 1e-6)
-
-        # --- Étape 3 : cross-covariance P_{xz} depuis les sigma-points ---
-        # Cov(v_{t+1}, r_t) approchée par la transformée non-parfumée seule
-        Pxz = 0.0
-        for i in range(len(Wm)):
-            dx = float(sigmas_f[i][0]) - float(self.x[0])
-            dz = float(sigmas_h[i][0]) - zp
-            Pxz += Wc[i] * dx * dz
-
-        # --- Étape 4 : CORRECTION ρ (terme manquant dans filterpy standard) ---
-        # Cov(ξ√v_t dW_2, √v_t dW_1) = ρ · ξ · v_t · Δt
-        # Injecté ici avant le calcul du gain
-        Pxz += self._rho_xi_vt_dt
-
-        # --- Étape 5 : gain de Kalman K = P_{xz} / S ---
-        # Clipping défensif pour éviter les explosions numériques quand v_t approche 0
-        K = np.clip(Pxz / S_val, -20.0, 20.0)
-
-        # --- Étape 6 : mise à jour état et covariance ---
-        innovation = float(z) - zp
-        self.x[0] = max(float(self.x[0]) + K * innovation, 1e-6)
-        self.P[0, 0] = max(self.P[0, 0] - K * S_val * K, 1e-10)
-
-        # Sauvegarde pour diagnostics (log-vraisemblance)
-        self.S   = np.array([[S_val]])
-        self.K   = np.array([[K]])
-        self.zp  = zp
-        self._innovation = innovation
-
-
-# =============================================================================
-# Factory interne — construit un HestonUKFCore initialisé
-# =============================================================================
-
-def _build_ukf_core(params: HestonParams, dt: float, v0: float) -> HestonUKFCore:
-    """Instancie et initialise un HestonUKFCore pour l'état scalaire v_t.
-
-    Dimensions : dim_x = 1 (variance v_t),  dim_z = 1 (log-return r_t).
-
-    Sigma-points (Merwe Scaled)
-    ---------------------------
-    Avec n=1, on génère 2n+1 = 3 points :
-        σ_0 = v̂_t                         (centre, poids W_0)
-        σ_1 = v̂_t + √((n+λ)·P)           (droite)
-        σ_2 = v̂_t − √((n+λ)·P)           (gauche)
-    Les paramètres α=1e-3, β=2, κ=0 sont les valeurs standards pour des
-    distributions proches de la gaussienne avec état positif borné.
-
-    Paramètres
-    ----------
-    params : HestonParams  Paramètres calibrés.
-    dt     : float         Pas de temps en années (ex : 1/252).
-    v0     : float         Variance initiale (typiquement params.theta).
-    """
-    # Générateur de sigma-points selon la méthode de Merwe et al. (2000)
-    # alpha=1e-3 : points très proches de la moyenne (évite v_t < 0 lors de la propagation)
-    # beta=2     : optimal pour gaussienne (annule l'erreur de Taylor d'ordre 4)
-    # kappa=0    : scaling secondaire standard pour n=1
-    # ------------------------------------------------------------------
-    # Fonction d'état f(v_t) — partie déterministe de l'EDS de la variance
-    # dv_t = κ(θ − v_t)dt  +  ξ√v_t dW_2,t
-    # La partie stochastique (ξ√v_t dW_2) est capturée par Q_t = ξ²v_t Δt.
-    # ------------------------------------------------------------------
-    def fx(v: np.ndarray, dt: float) -> np.ndarray:
-        v_val = max(float(v[0]), 1e-6)
-        # Drift de mean-reversion : κ pousse v_t vers θ
-        v_next = v_val + params.kappa * (params.theta - v_val) * dt
-        # Clamp : la variance ne peut pas être négative (propriété de Heston)
-        return np.array([max(v_next, 1e-6)])
-
-    # ------------------------------------------------------------------
-    # Fonction d'observation h(v_t) — espérance du log-return
-    # De l'EDS de S_t via formule d'Itô sur log S_t :
-    # d(log S_t) = (μ − v_t/2)dt + √v_t dW_{1,t}
-    # ⟹ E[r_t | v_t] = (μ − v_t/2) Δt
-    # Le terme −v_t/2 est la correction d'Itô (convexity adjustment).
-    # ------------------------------------------------------------------
-    def hx(v: np.ndarray) -> np.ndarray:
-        v_val = max(float(v[0]), 1e-6)
-        # Correction d'Itô : l'espérance du log-return dépend de v_t
-        return np.array([(params.mu - 0.5 * v_val) * dt])
-
-    # Construction du filtre avec le nouveau constructeur autonome
-    ukf = HestonUKFCore(
-        fx  = fx,
-        hx  = hx,
-        x0  = v0,
-        P0  = v0,
-        Q0  = params.xi ** 2 * v0 * dt,   # Bruit de processus Q_t = ξ² v_t Δt
-        R0  = v0 * dt,                      # Bruit de mesure R_t = v_t Δt
-        dt  = dt,
-    )
-
-    # Initialisation de la correction ρ (sera recalculée à chaque step)
-    ukf._rho_xi_vt_dt = params.rho * params.xi * v0 * dt
-
-    return ukf
-
+from investment_lab.stochastic.heston import HestonParams
+from investment_lab.stochastic.kalman import HestonUKFCore, build_ukf_core
 
 # =============================================================================
 # HestonUKF — classe principale : fit / filter / spread
@@ -544,7 +277,7 @@ class HestonUKF:
 
         # Initialiser le filtre avec theta comme variance de départ
         v0 = max(params.theta, 1e-6)
-        ukf = _build_ukf_core(params, self.dt, v0)
+        ukf = build_ukf_core(params, self.dt, v0)
         ll = 0.0
 
         try:
@@ -844,7 +577,7 @@ class HestonUKF:
         if self._rolling_params is None:
             params = self._params
             v0 = max(params.theta, 1e-6)
-            ukf = _build_ukf_core(params, self.dt, v0)
+            ukf = build_ukf_core(params, self.dt, v0)
             iter_dates = returns.index
         else:
             iter_dates = self._rolling_params.index.intersection(returns.index)
@@ -852,7 +585,7 @@ class HestonUKF:
                 raise RuntimeError("Aucune date commune entre les paramètres rolling et les returns.")
             first_params = self._record_to_params(self._rolling_params.loc[iter_dates[0]])
             v0 = max(first_params.theta, 1e-6)
-            ukf = _build_ukf_core(first_params, self.dt, v0)
+            ukf = build_ukf_core(first_params, self.dt, v0)
 
         rows = []
         for date in iter_dates:
@@ -895,68 +628,6 @@ class HestonUKF:
         """
         df_diag = self.filter_with_diagnostics(log_returns)
         return df_diag["v_hat"].rename("v_hat")
-
-    # ------------------------------------------------------------------
-    # forecast_variance() — forecast ponctuelle de variance
-    # ------------------------------------------------------------------
-
-    def forecast_variance(
-        self,
-        v_t: float,
-        horizon: int = 21,
-        params: Optional[HestonParams] = None,
-    ) -> float:
-        """Prévision de variance conditionnelle E[v_{t+h} | v_t].
-        
-        Utilise la formule analytique de Heston pour la prévision de variance
-        à horizon h (en jours): E[v_{t+h} | v_t] = θ+(v_t​−θ)e^−κu
-        """
-        p = params or self._params
-        if p is None:
-            raise RuntimeError("Paramètres non calibrés.")
-
-        v_t = max(float(v_t), 1e-6)
-        tau = horizon * self.dt
-        v_forecast = p.theta + (v_t - p.theta) * np.exp(-p.kappa * tau)
-        return max(float(v_forecast), 1e-6)
-    
-    # ------------------------------------------------------------------
-    # forecast_average_variance() — forecast moyenne de variance
-    # ------------------------------------------------------------------
-    
-    def forecast_average_variance(
-        self,
-        v_t: float,
-        horizon: int = 21,
-        params: Optional[HestonParams] = None,
-    ) -> float:
-        """Prévision de variance moyenne sur l'horizon [t, t+h]."""
-        p = params or self._params
-        if p is None:
-            raise RuntimeError("Paramètres non calibrés.")
-
-        v_t = max(float(v_t), 1e-6)
-        tau = horizon * self.dt
-
-        if p.kappa < 1e-10:
-            v_avg = v_t
-        else:
-            decay_term = (1.0 - np.exp(-p.kappa * tau)) / (p.kappa * tau)
-            v_avg = p.theta + (v_t - p.theta) * decay_term
-        return max(float(v_avg), 1e-6)
-    
-    # ----------------------------------------------------------------------------
-    # forecast_average_volatility() — helper pour forecast moyenne de volatilité
-    # ----------------------------------------------------------------------------
-    
-    def forecast_average_volatility(
-        self,
-        v_t: float,
-        horizon: int = 21,
-        params: Optional[HestonParams] = None,
-    ) -> float:
-        """Prévision de volatilité annualisée moyenne sur horizon."""
-        return np.sqrt(self.forecast_average_variance(v_t, horizon=horizon, params=params))
 
     # ------------------------------------------------------------------
     # Propriétés dérivées
@@ -1019,239 +690,70 @@ class HestonUKF:
             raise RuntimeError("Appeler filter_with_diagnostics() d'abord.")
         return self._filter_diagnostics.copy()    
 
+    # ------------------------------------------------------------------
+    # forecast_variance() — forecast ponctuelle de variance
+    # ------------------------------------------------------------------
 
-# =============================================================================
-# VolatilityTiming — allocation dynamique depuis le spread s_t
-# =============================================================================
-
-class VolatilityTiming:
-    """Convertit le spread s_t en signal d'allocation et l'applique aux positions.
-
-    Intuition
-    ---------
-    Le spread s_t = σ_IV − σ̂_t mesure la "cherté" de la volatilité implicite
-    par rapport à la volatilité réalisée estimée. On l'utilise pour scaler
-    dynamiquement les poids de la stratégie de base :
-        w_t = w_base × f(s_t)
-
-    Modes de normalisation
-    ----------------------
-    "linear"    → signal = clip(s_t / rolling_std(s_t), ±max_leverage)
-                  Proportionnel au spread normalisé par sa volatilité récente.
-
-    "rank"      → signal = percentile roulant recentré dans [−max_leverage, +max_leverage]
-                  Robuste aux outliers, agnostique à l'unité de mesure de s_t.
-
-    "threshold" → signal = +1 si s_t > +seuil, −1 si s_t < −seuil, 0 sinon
-                  Binaire, adapté à un sizing discret (full in / out).
-
-    Paramètres
-    ----------
-    scaling      : str    Mode de normalisation (défaut "linear").
-    lookback     : int    Fenêtre de normalisation en jours (défaut 63 ~ 3 mois).
-    max_leverage : float  Multiplicateur maximum en valeur absolue (défaut 2.0).
-    threshold    : float  Seuil en points de vol pour le mode "threshold" (défaut 0.02).
-    """
-
-    def __init__(
+    def forecast_variance(
         self,
-        scaling: str = "linear",
-        lookback: int = 63,
-        max_leverage: float = 2.0,
-        threshold: float = 0.02,
-    ) -> None:
-        if scaling not in ("linear", "rank", "threshold"):
-            raise ValueError("scaling doit être 'linear', 'rank' ou 'threshold'.")
-        self.scaling = scaling
-        self.lookback = lookback
-        self.max_leverage = max_leverage
-        self.threshold = threshold
-
-    def compute_signal(self, spread: pd.Series) -> pd.Series:
-        """Normalise s_t en signal d'allocation dans [−max_leverage, +max_leverage].
-
-        Paramètres
-        ----------
-        spread : pd.Series  s_t = σ_IV − σ̂_t
-
-        Retourne
-        --------
-        pd.Series  Signal de timing (même index que spread.dropna()).
+        v_t: float,
+        horizon: int = 21,
+        params: Optional[HestonParams] = None,
+    ) -> float:
+        """Prévision de variance conditionnelle E[v_{t+h} | v_t].
+        
+        Utilise la formule analytique de Heston pour la prévision de variance
+        à horizon h (en jours): E[v_{t+h} | v_t] = θ+(v_t​−θ)e^−κu
         """
-        spread = spread.dropna()
+        p = params or self._params
+        if p is None:
+            raise RuntimeError("Paramètres non calibrés.")
 
-        if self.scaling == "linear":
-            # Écart-type roulant de s_t sur la fenêtre lookback
-            s_std = (
-                spread.rolling(self.lookback, min_periods=5)
-                .std()
-                .replace(0.0, np.nan)
-            )
-            # Signal = s_t normalisé par son écart-type récent, clipé à ±max_leverage
-            signal = (spread / s_std).clip(-self.max_leverage, self.max_leverage)
+        v_t = max(float(v_t), 1e-6)
+        tau = horizon * self.dt
+        v_forecast = p.theta + (v_t - p.theta) * np.exp(-p.kappa * tau)
+        return max(float(v_forecast), 1e-6)
 
-        elif self.scaling == "rank":
-            # Rang percentile roulant de s_t (0 = min historique, 1 = max historique)
-            rank = spread.rolling(self.lookback, min_periods=5).rank(pct=True)
-            # Recentrage : rang 0.5 → 0 (neutre), 1.0 → +max_leverage, 0.0 → −max_leverage
-            signal = ((rank - 0.5) * 2.0 * self.max_leverage).clip(
-                -self.max_leverage, self.max_leverage
-            )
+    # ------------------------------------------------------------------
+    # forecast_average_variance() — forecast moyenne de variance
+    # ------------------------------------------------------------------
 
-        else:  # threshold
-            # Signal binaire : ±1 au-delà des bandes ±threshold, 0 à l'intérieur
-            signal = pd.Series(
-                np.where(
-                    spread >  self.threshold,  1.0,
-                    np.where(spread < -self.threshold, -1.0, 0.0),
-                ),
-                index=spread.index,
-            )
-
-        signal.name = "timing_signal"
-        return signal
-
-    def apply_timing(
+    def forecast_average_variance(
         self,
-        df_positions: pd.DataFrame,
-        signal: pd.Series,
-        lag_bdays: int = 1,
-    ) -> pd.DataFrame:
-        """Multiplie les poids de la stratégie par le signal de timing.
+        v_t: float,
+        horizon: int = 21,
+        params: Optional[HestonParams] = None,
+    ) -> float:
+        """Prévision de variance moyenne sur l'horizon [t, t+h]."""
+        p = params or self._params
+        if p is None:
+            raise RuntimeError("Paramètres non calibrés.")
 
-        Le signal est décalé d'un jour ouvré par défaut : le poids appliqué à la
-        date t est donc construit à partir de l'information disponible en t-1.
-        Cela évite qu'une position prise à la date t utilise déjà r_t ou σ̂_t.
+        v_t = max(float(v_t), 1e-6)
+        tau = horizon * self.dt
 
-        Les dates sans signal disponible reçoivent un multiplicateur 1.0 (neutre),
-        pour ne pas introduire de gaps dans la série de positions.
+        if p.kappa < 1e-10:
+            v_avg = v_t
+        else:
+            decay_term = (1.0 - np.exp(-p.kappa * tau)) / (p.kappa * tau)
+            v_avg = p.theta + (v_t - p.theta) * decay_term
+        return max(float(v_avg), 1e-6)
 
-        Paramètres
-        ----------
-        df_positions : pd.DataFrame  Sortie de OptionTrade.generate_trades.
-        signal       : pd.Series     Sortie de compute_signal (index = dates).
-        lag_bdays    : int           Décalage d'exécution en jours ouvrés.
+    # ----------------------------------------------------------------------------
+    # forecast_average_volatility() — helper pour forecast moyenne de volatilité
+    # ----------------------------------------------------------------------------
 
-        Retourne
-        --------
-        pd.DataFrame  Identique à l'entrée avec la colonne 'weight' rescalée.
-        """
-        df = df_positions.copy()
-
-        signal_exec = signal.copy()
-        if lag_bdays > 0:
-            signal_exec.index = signal_exec.index + pd.offsets.BDay(lag_bdays)
-
-        # Préparer le signal pour le merge (reset_index() car index = dates)
-        signal_df = (
-            signal_exec.rename("timing_signal")
-            .reset_index()
-            .rename(columns={"index": "date"})
-        )
-
-        # Left join : toutes les lignes de positions sont conservées
-        df = df.merge(signal_df, on="date", how="left")
-
-        # Dates sans signal → multiplicateur neutre 1.0 (pas de levier forcé)
-        df["timing_signal"] = df["timing_signal"].fillna(1.0)
-
-        # Application du timing : w_t = w_base × f(s_t)
-        df["weight"] = df["weight"] * df["timing_signal"]
-        df = df.drop(columns=["timing_signal"])
-
-        logging.info(
-            "Volatility timing appliqué à %d lignes avec un lag de %d jour(s) ouvré(s).",
-            len(df),
-            lag_bdays,
-        )
-        return df
+    def forecast_average_volatility(
+        self,
+        v_t: float,
+        horizon: int = 21,
+        params: Optional[HestonParams] = None,
+    ) -> float:
+        """Prévision de volatilité annualisée moyenne sur horizon."""
+        return np.sqrt(self.forecast_average_variance(v_t, horizon=horizon, params=params))
 
 
-# =============================================================================
-# build_timing_positions — helper end-to-end
-# =============================================================================
 
-def build_timing_positions(
-    df_positions: pd.DataFrame,
-    log_returns: pd.Series,
-    sigma_iv: pd.Series,
-    fit_window: int = 252,
-    scaling: str = "linear",
-    lookback: int = 63,
-    max_leverage: float = 2.0,
-    threshold: float = 0.02,
-    signal_lag_bdays: int = 1,
-    dt: float = 1.0 / 252.0,
-    initial_params: Optional[HestonParams] = None,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Pipeline complet : calibration UKF → spread → timing → positions dynamiques.
 
-    Enchaîne les 5 étapes du workflow dans l'ordre correct :
-        1. HestonUKF.fit()                        calibration MLE roulante
-        2. HestonUKF.filter()                     estimation de v̂_t
-        3. HestonUKF.implied_realized_spread()    calcul de s_t = σ_IV − σ̂_t
-        4. VolatilityTiming.compute_signal()      normalisation du signal
-        5. VolatilityTiming.apply_timing()        application aux poids avec lag d'exécution
 
-    Paramètres
-    ----------
-    df_positions    : pd.DataFrame  Positions de base (sortie de generate_trades).
-    log_returns     : pd.Series     Log-returns journaliers du sous-jacent.
-    sigma_iv        : pd.Series     Volatilité implicite ATM annualisée.
-    fit_window      : int           Fenêtre MLE roulante (défaut 252 = 1 an).
-    scaling         : str           Mode de timing : "linear", "rank", "threshold".
-    lookback        : int           Fenêtre de normalisation du signal (défaut 63).
-    max_leverage    : float         Multiplicateur maximum |w_t / w_base| (défaut 2.0).
-    signal_lag_bdays: int           Lag d'exécution du signal (défaut 1 jour ouvré).
-    dt              : float         Pas de temps en années (défaut 1/252).
-    initial_params  : HestonParams  Point de départ MLE (défaut : valeurs typiques equity).
 
-    Retourne
-    --------
-    df_timed_positions : pd.DataFrame  Positions avec poids dynamiques.
-    spread             : pd.Series     s_t = σ_IV,t − σ̂_t.
-    signal             : pd.Series     Signal de timing normalisé.
-
-    Exemple d'usage dans un notebook
-    ---------------------------------
-    >>> from investment_lab.heston_ukf import build_timing_positions
-    >>> from investment_lab.metrics.util import levels_to_returns
-    >>>
-    >>> log_returns = levels_to_returns(df_spot["spot"])
-    >>> sigma_iv    = df_atm["implied_volatility"]
-    >>>
-    >>> df_timed, spread, signal = build_timing_positions(
-    ...     df_positions = df_base,
-    ...     log_returns  = log_returns,
-    ...     sigma_iv     = sigma_iv,
-    ...     fit_window   = 252,
-    ...     scaling      = "linear",
-    ... )
-    >>> backtest_timed = StrategyBacktester(df_timed).compute_backtest()
-    >>> backtest_base  = StrategyBacktester(df_base).compute_backtest()
-    >>>
-    >>> # Comparaison NAV
-    >>> backtest_base.nav["NAV"].plot(label="Base")
-    >>> backtest_timed.nav["NAV"].plot(label="Timed (UKF)")
-    """
-    logging.info("Démarrage du pipeline HestonUKF timing.")
-
-    # Étapes 1 & 2 : calibration des paramètres puis filtrage de v̂_t
-    ukf = HestonUKF(initial_params=initial_params, dt=dt)
-    ukf.fit(log_returns, window=fit_window)
-    ukf.filter(log_returns)
-
-    # Étape 3 : spread  s_t = σ_IV,t − σ̂_t
-    spread = ukf.implied_realized_spread(sigma_iv)
-
-    # Étapes 4 & 5 : normalisation du signal et application aux poids
-    timer = VolatilityTiming(
-        scaling=scaling,
-        lookback=lookback,
-        max_leverage=max_leverage,
-        threshold=threshold, 
-    )
-    signal   = timer.compute_signal(spread)
-    df_timed = timer.apply_timing(df_positions, signal, lag_bdays=signal_lag_bdays)
-
-    return df_timed, spread, signal
