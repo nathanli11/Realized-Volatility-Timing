@@ -79,6 +79,7 @@ pyright
 pytz
 pywin32
 PyYAML
+pytest
 pyzmq
 requests
 scikit-learn
