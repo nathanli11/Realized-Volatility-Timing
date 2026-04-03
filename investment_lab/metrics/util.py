@@ -31,7 +31,7 @@ def returns_to_levels(returns: pd.Series, method: str = "log", base: float = 1.0
         Series of price levels.
     """
     if method == "log":
-        return base * np.expm1(returns).cumsum()
+        return base * np.exp(returns.cumsum())
     elif method == "simple":
         return base * (1 + returns).cumprod()
     else:

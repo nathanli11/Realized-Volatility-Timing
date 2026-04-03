@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.cache/
+
+# Ancien cache local (format pkl, remplacé par data/derived/)
+.cache/
+
+# OS
+.DS_Store
+**/.DS_Store
+
+# Env
+.env
+.venv/
+venv/
+
+# Data brute (trop lourde pour git)
+# Les fichiers parquet de cache UKF dans data/derived/ sont eux commités volontairement
+data/*.parquet
+data/*.csv
