@@ -244,7 +244,7 @@ RISK_REVERSAL_1M_15D: list[OptionLegSpec] = [
     },
     {
         "day_to_expiry_target": 7 * 4,
-        "strike_target": 0.25,
+        "strike_target": 0.15,
         "strike_col": "delta",
         "call_or_put": "C",
         "weight": 1 / 4,
@@ -382,7 +382,7 @@ SHORT_PUT_SPREAD_1M_95_100: list[OptionLegSpec] = [
     },
 ]
 
-SHORT_PUT_SPREAD_1W_20D_40D: list[OptionLegSpec] = [
+SHORT_PUT_SPREAD_1W_10D_30D: list[OptionLegSpec] = [
     {
         "day_to_expiry_target": 7,
         "strike_target": -0.3,

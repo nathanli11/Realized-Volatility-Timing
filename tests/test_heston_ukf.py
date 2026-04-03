@@ -62,10 +62,10 @@ def test_filter_with_rolling_params_returns_series_aligned_on_rolling_index(monk
     )
 
     monkeypatch.setattr("investment_lab.stochastic.heston_ukf.build_ukf_core", lambda *args, **kwargs: object())
-    monkeypatch.setattr(ukf, "_update_core_functions", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ukf, "_update_ukf_functions", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         ukf,
-        "_step",
+        "_ukf_step",
         lambda _core, params, _r: {
             "v_hat": params.theta,
             "sigma_hat": np.sqrt(params.theta),
@@ -167,7 +167,7 @@ def test_log_likelihood_uses_step_diagnostics(monkeypatch):
     monkeypatch.setattr("investment_lab.stochastic.heston_ukf.build_ukf_core", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         ukf,
-        "_step",
+        "_ukf_step",
         lambda _core, _params, _r: {
             "v_hat": 0.04,
             "sigma_hat": 0.2,

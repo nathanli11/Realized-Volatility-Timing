@@ -1,82 +1,133 @@
 """
 heston.py
-=========
-Dataclass des paramètres du modèle de Heston (1993).
 
-Le modèle de Heston décrit la dynamique conjointe du prix S_t et de sa variance
-instantanée v_t sous la mesure risque-neutre :
+Parameter container for the Heston stochastic volatility model.
 
-    dS_t  = μ S_t dt  +  S_t √v_t  dW_{1,t}
-    dv_t  = κ(θ - v_t) dt  +  ξ √v_t  dW_{2,t}
-    dW_1 · dW_2 = ρ dt
+This module defines a small dataclass used to store the five model parameters
+required by the Heston variance process and the associated price dynamics.
 
-Les 5 paramètres (κ, θ, ξ, ρ, μ) sont calibrés par MLE dans HestonUKF.fit().
+The parameter set is used throughout the project, especially during rolling
+maximum likelihood calibration and Unscented Kalman Filter state estimation.
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+
 import numpy as np
 
 
 @dataclass
 class HestonParams:
-    """Paramètres du modèle de Heston (1993).
+    """
+    Store the parameters of the Heston stochastic volatility model.
 
-    Attributs
-    ---------
-    kappa : float
-        Vitesse de retour à la moyenne de v_t vers θ.
-        Plus κ est grand, plus la variance revient rapidement à sa moyenne.
-    theta : float
-        Variance long terme (niveau d'équilibre de v_t).
-        La volatilité long terme associée est √θ.
-    xi : float
-        Vol-of-vol : amplitude des chocs sur la variance.
-        Un xi élevé implique une volatilité très variable dans le temps.
-    rho : float
-        Corrélation entre les deux mouvements browniens.
-        Typiquement négatif sur les actions (effet levier : quand le prix baisse, la vol monte).
-    mu : float
-        Drift du log-prix sous la mesure physique.
+    The class is a lightweight container used to pass model parameters between
+    calibration, filtering, and forecasting components.
+
+    Attributes:
+    kappa : float, default 2.0
+        Mean reversion speed of the variance process.
+        A larger value means that variance returns more quickly toward its long-run level.
+
+    theta : float, default 0.04
+        Long-run variance level.
+        This is the equilibrium level toward which variance mean reverts.
+
+    xi : float, default 0.3
+        Volatility of variance, often called vol of vol.
+        A larger value means that variance itself moves more aggressively over time.
+
+    rho : float, default -0.7
+        Correlation between the Brownian motion driving the asset return and the Brownian motion driving the variance process.
+        This parameter is often negative in equity markets.
+
+    mu : float, default 0.0
+        Drift parameter of the return process under the chosen measure.
+        In this project, it is estimated jointly with the variance parameters.
     """
 
     kappa: float = 2.0
     theta: float = 0.04
-    xi:    float = 0.3
-    rho:   float = -0.7
-    mu:    float = 0.0
+    xi: float = 0.3
+    rho: float = -0.7
+    mu: float = 0.0
 
     def feller_satisfied(self) -> bool:
-        """Vérifie la condition de Feller : 2κθ > ξ².
-
-        Quand cette condition est respectée, le processus CIR de la variance
-        ne peut pas atteindre zéro, ce qui garantit v_t > 0 presque sûrement.
-        Si elle n'est pas satisfaite, v_t peut toucher zéro et les racines carrées
-        dans le modèle deviennent problématiques numériquement.
         """
-        return 2.0 * self.kappa * self.theta > self.xi ** 2
+        Check whether the Feller condition is satisfied.
+
+        The Feller condition is a standard stability condition for square-root variance processes. 
+        When it is satisfied, the variance process is less likely to hit zero, which is desirable for both financial interpretation
+        and numerical stability.
+
+        Parameters:
+        None
+
+        Returns:
+        bool
+            True if the Feller condition is satisfied, otherwise False
+        """
+        return 2.0 * self.kappa * self.theta > self.xi**2
 
     def to_array(self) -> np.ndarray:
-        """Sérialise les 5 paramètres en vecteur numpy pour l'optimiseur L-BFGS-B."""
+        """
+        Convert the parameter set into a NumPy array.
+
+        This helper is mainly used when passing parameters to numerical optimizers such as L-BFGS-B
+
+        Parameters:
+        None
+
+        Returns:
+        np.ndarray
+            One-dimensional NumPy array containing the parameters in the following order: kappa, theta, xi, rho, mu
+        """
         return np.array([self.kappa, self.theta, self.xi, self.rho, self.mu])
 
     @classmethod
     def from_array(cls, x: np.ndarray) -> "HestonParams":
-        """Reconstruit un HestonParams depuis un vecteur numpy (inverse de to_array)."""
-        return cls(kappa=x[0], theta=x[1], xi=x[2], rho=x[3], mu=x[4])
+        """
+        Build a HestonParams instance from a NumPy array
+
+        This is the inverse operation of "to_array". It is useful when an optimizer returns a parameter vector 
+        that must be converted back into a structured parameter object.
+
+        Parameters:
+        x : np.ndarray
+            One-dimensional NumPy array containing the parameters in the following order: kappa, theta, xi, rho, mu
+
+        Returns:
+        HestonParams
+            New instance built from the input array
+        """
+        return cls(
+            kappa=float(x[0]),
+            theta=float(x[1]),
+            xi=float(x[2]),
+            rho=float(x[3]),
+            mu=float(x[4]),
+        )
 
     @staticmethod
-    def bounds() -> list[tuple]:
-        """Bornes des paramètres pour l'optimiseur L-BFGS-B.
+    def bounds() -> list[tuple[float, float]]:
+        """
+        Return parameter bounds for numerical optimization
 
-        Ces bornes empêchent l'optimiseur d'explorer des régions économiquement
-        absurdes (variance négative, corrélation hors [-1,1], etc.).
+        These bounds are designed to keep the optimizer inside economically meaningful and numerically stable regions. 
+        They are used during rolling maximum likelihood calibration.
+
+        Parameters:
+        None
+
+        Returns:
+        list[tuple[float, float]]
+            List of lower and upper bounds for each parameter, in the following order: kappa, theta, xi, rho, mu
         """
         return [
-            (1e-3, 20.0),       # kappa  : vitesse de mean-reversion > 0
-            (1e-4,  1.0),       # theta  : variance long terme > 0
-            (1e-3,  5.0),       # xi     : vol-of-vol > 0
-            (-0.999, 0.999),    # rho    : corrélation strictement dans (-1, 1)
-            (-1.0,   1.0),      # mu     : drift borné (annualisé)
+            (1e-3, 20.0),      # kappa must remain strictly positive
+            (1e-4, 1.0),       # theta must remain strictly positive
+            (1e-3, 5.0),       # xi must remain strictly positive
+            (-0.999, 0.999),   # rho must stay strictly inside the correlation range
+            (-1.0, 1.0),       # mu is kept inside a reasonable annualized range
         ]
