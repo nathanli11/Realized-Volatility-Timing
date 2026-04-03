@@ -53,13 +53,13 @@ class StrategyBacktester:
         df_positions["dt"] = 1
 
         logging.info("Append previous period greeks for P&L calculations.")
-        # Correctif : utiliser .bfill() au lieu du fillna(method="bfill") déprécié
+        # Utilisation de .bfill() au lieu du fillna(method="bfill") 
         df_positions["prev_theta"] = df_positions.groupby("option_id")["theta"].shift(1).bfill()
         df_positions["prev_gamma"] = df_positions.groupby("option_id")["gamma"].shift(1).bfill()
         df_positions["prev_delta"] = df_positions.groupby("option_id")["delta"].shift(1).bfill()
         df_positions["prev_vega"] = df_positions.groupby("option_id")["vega"].shift(1).bfill()
 
-        # Correctif : aligner sur les jours ouvrés pour que obs_date corresponde correctement à l’index de NAV
+        # Alignement sur les jours ouvrés pour que obs_date corresponde correctement à l’index de NAV
         df_positions["obs_date"] = df_positions["entry_date"].apply(
             lambda x: x - pd.offsets.BDay(1)
         )
@@ -100,12 +100,11 @@ class StrategyBacktester:
             df_day["leverage"] = df_day["scaled_weight"] * df_day["spot"]
             df_day["cashflow"] = 0.0
 
-            # Flux de trésorerie à l’entrée : paiement de la prime (négatif pour une position longue, positif pour une position courte)
+
             df_day.loc[df_day["entry_date"] == df_day["date"], "cashflow"] = (
                 -df_day["scaled_weight"] * df_day["mid"]
             )
 
-            # Correctif : utiliser le payoff intrinsèque à l’échéance au lieu d’un mid potentiellement obsolète
             expiry_mask = df_day["expiration"] == df_day["date"]
             if expiry_mask.any():
                 call_put_filled = df_day["call_put"].fillna("")
@@ -127,7 +126,7 @@ class StrategyBacktester:
 
             df_pnl = pd.concat([df_pnl, df_day.groupby("date")[self._PNL_COLS].sum()])
 
-            # Correctif : extraire une valeur scalaire de NAV pour éviter l’ambiguïté d’une Series
+
             if d not in df_nav.index:
                 latest_nav_val = float(df_nav["NAV"].iloc[-1])
             else:
@@ -153,7 +152,7 @@ class StrategyBacktester:
         tickers = df_positions_cp["ticker"].unique().tolist()
         df_options = OptionLoader.load_data(start, end, process_kwargs={"ticker": tickers})
 
-        # Ligne spot synthétique pour valoriser correctement les jambes de couverture delta
+        # Ligne spot pour valoriser correctement les jambes de couverture delta
         df_spot = (
             df_options.groupby(["date", "ticker"])
             .apply(
